@@ -1,7 +1,11 @@
 ## Local run
 
 ```bash
-python -m app.server --mode local --data-dir .
+python -m server --mode local --data-dir .
+
+or 
+
+python -m server --mode local --data-dir /home/niklas/PSI/cme-viewer/dat/cmecme/cmecme_poly_part1_run1a_cme/cor_mhd
 ```
 Browser opens automatically.
 

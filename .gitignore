@@ -1,3 +1,10 @@
+# Project files
+obsolete-stuff/
+dat/
+.vscode/
+pyvisual/pyvisual/
+example.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
