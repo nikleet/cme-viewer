@@ -2,11 +2,8 @@
 
 ```bash
 python -m server --mode local --data-dir .
-
-or 
-
-python -m server --mode local --data-dir /home/niklas/PSI/cme-viewer/dat/cmecme/cmecme_poly_part1_run1a_cme/cor_mhd
 ```
+
 Browser opens automatically.
 
 ## Remote run (SSH tunnel)
@@ -26,3 +23,7 @@ Open in browser:
 http://localhost:8080
 ```
 
+## Notes for me
+```
+python -m server --mode local --data-dir /home/niklas/PSI/cmecme/cmecme_poly_part1_run1a_cme/cor_mhd
+```
