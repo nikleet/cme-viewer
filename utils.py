@@ -3,12 +3,9 @@
 import numpy as np
 import datetime as dt
 from glob import glob
-import pyvista as pv
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import cm
-
-from pyvisual.core._typing import FrameType, FlColorType
 
 class MplColorHelper:
     """
@@ -37,8 +34,8 @@ def mastime_to_ut(mas_times: str, t0: dt.datetime = None) -> list[dt.datetime]:
     """
     Converts mastimes dict to a list of UT datetimes.
     
-    fname: dict   dict of sequence and mastimes from dumps or masTime .txt file  
-    t0: datetime    initial time at start of run
+    fname:  dict of sequence and mastimes from dumps or masTime.txt file  
+    t0:     datetime initial time at start of run
     
     Returns:
     times_ut        A list of UT datetimes.
@@ -65,7 +62,7 @@ def mastime_to_ut(mas_times: str, t0: dt.datetime = None) -> list[dt.datetime]:
 
 # ========= IO UTILITIES =========
 
-def get_mag_files(data_folder):
+def get_mag_files(data_folder: str):
     br_files = glob(data_folder + '/br*')
     bt_files = glob(data_folder + '/bt*')
     bp_files = glob(data_folder + '/bp*')

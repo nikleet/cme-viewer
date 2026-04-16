@@ -6,7 +6,7 @@ from pyvisual.core._mesh_parser import (
     mesh_grid_scales, stack_grid_scales, unravel_values
 )
 
-# TODO: Double check that this works and implement in scenen_manager
+# TODO: Double check that this works and implement in scene_manager
 
 def create_mgram_mesh(*args, 
                       iframe='rtp', 
