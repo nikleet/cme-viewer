@@ -5,6 +5,7 @@ dat/
 pyvisual/
 examples/
 config.yaml
+todo.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

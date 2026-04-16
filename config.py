@@ -28,16 +28,18 @@ class RuntimeConfig:
 
 @dataclass
 class SimulationConfig:
-    """Settings related to the CME data and simulation bounds."""
+    """Settings related to the CME data and simulation metadata."""
     # defaults:
     data_dir: Optional[Path] = None
-    time_stamps: str = "mas_dumps_3d.txt"
     t0: Optional[str] = None
+    time_file: str = "mas_dumps_3d.txt"
     tracer_header: str = "tracer_header.dat"
     tracer_prefix: str = "tracers_pos"
     lp_prefix: Optional[str] = "lp_"
     bg_lp: Optional[str] = None
-    label_select: Optional[str] = "apex,axis,arcade,ring_lp_03,ring_lp_05,ring_lp_07,ring_lp_09,ring_lp_11,ring_lp_13,ring_lp_15,ring_lp_17,background"  
+    label_select: Optional[str] = "apex,axis,arcade,ring_lp_03,ring_lp_05, \
+                                    ring_lp_07,ring_lp_09,ring_lp_11,ring_lp_13, \
+                                    ring_lp_15,ring_lp_17,background"  
     max_traces: int = 50
     max_steps: int = 500
 
@@ -48,7 +50,7 @@ class AppConfig:
     sim: SimulationConfig = field(default_factory=SimulationConfig)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Converts to dict, safely casting Paths to strings for YAML."""
+        """Converts to dict, casting Paths to strings for YAML."""
         def _serialize(obj):
             if isinstance(obj, Path): return str(obj)
             if isinstance(obj, dict): return {k: _serialize(v) for k, v in obj.items()}
@@ -123,13 +125,13 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
         if hasattr(args, 'max_steps') and args.max_steps: cfg.sim.max_steps = args.max_steps
         if hasattr(args, 'label_select') and args.label_select: cfg.sim.label_select = args.label_select
         if hasattr(args, 'bg_lp') and args.bg_lp: cfg.sim.bg_lp = args.bg_lp
-        if hasattr(args, 'time_stamps') and args.time_stamps: cfg.sim.time_stamps = args.time_stamps
+        if hasattr(args, 'time_file') and args.time_file: cfg.sim.time_file = args.time_file
         if hasattr(args, 't0') and args.t0: cfg.sim.t0 = args.t0
         if hasattr(args, 'tracer_header') and args.tracer_header: cfg.sim.tracer_header = args.tracer_header
         if hasattr(args, 'tracer_prefix') and args.tracer_prefix: cfg.sim.tracer_prefix = args.tracer_prefix
         if hasattr(args, 'lp_prefix') and args.lp_prefix: cfg.sim.lp_prefix = args.lp_prefix
         
-        # ... map remaining args as needed ...
+        # ... add remaining args as needed ...
 
     return cfg
 
