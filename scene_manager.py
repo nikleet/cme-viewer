@@ -6,18 +6,16 @@ import pyvista as pv
 import numpy as np
 from pathlib import Path
 
-from typing import Optional
-
 from mapflpy.scripts import run_forward_tracing
 from mapflpy.utils import fetch_default_launch_points
 from psi_io import read_hdf_by_index
 
-from utils import make_splines
-
+from config import SimulationConfig
 
 class SceneManager:
-    def __init__(self, data_dir: str, cache_dir: str = ".cache", **kwargs):
-        self.data_dir = data_dir
+    def __init__(self, cfg: SimulationConfig, cache_dir: str = ".cache", **kwargs):
+        self.data_dir = str(cfg.data_dir)
+        self.run_id = self.data_dir.split("/")[-1]
 
         # Setup caching directory
         self.cache_dir = Path(cache_dir)
@@ -47,15 +45,16 @@ class SceneManager:
         self.total_frames = len(mag_files_list)
         print(f"Checking cache for {self.total_frames} frames...")
 
-        for idx, mag_files in enumerate(mag_files_list):
-            fl_path = self.cache_dir / f"frame_{idx:06d}_fl.vtp"
-            mgram_path = self.cache_dir / f"frame_{idx:06d}_mgram.vts"
+        for frame_idx, mag_files in enumerate(mag_files_list):
+            
+            fl_path = self.cache_dir / f"frame_{frame_idx:04d}_fl_{self.run_id}.vtp"
+            mgram_path = self.cache_dir / f"frame_{frame_idx:04d}_mgram_{self.run_id}.vts"
 
             # If both files already exist on disk, skip the heavy processing!
             if fl_path.exists() and mgram_path.exists():
                 continue
 
-            print(f"Processing and caching frame {idx}...")
+            print(f"Processing and caching frame {frame_idx}...")
             temp_plotter = Plot3d()
             # Note: Ideally, we bypass creating actors here entirely and just generate the pyvisual.DataSet directly. 
             # If your _make_sun_actors relies heavily on the plotter, we use a hidden temp plotter, but extract ONLY the mesh.
@@ -73,18 +72,18 @@ class SceneManager:
 
         print("Caching complete.")
 
-    def set_frame(self, frame_index: int):
+    def set_frame(self, frame_idx: int):
         """
         Reads the mesh directly from the disk cache and updates the actors.
         """
-        if frame_index < 0 or frame_index >= self.total_frames:
+        if frame_idx < 0 or frame_idx >= self.total_frames:
             return
 
-        fl_path = self.cache_dir / f"frame_{frame_index:06d}_fl.vtp"
-        mgram_path = self.cache_dir / f"frame_{frame_index:06d}_mgram.vts"
+        fl_path = self.cache_dir / f"frame_{frame_idx:04d}_fl_{self.run_id}.vtp"
+        mgram_path = self.cache_dir / f"frame_{frame_idx:04d}_mgram_{self.run_id}.vts"
 
         if not fl_path.exists() or not mgram_path.exists():
-            print(f"Warning: Cache missing for frame {frame_index}")
+            print(f"Warning: Cache missing for frame {frame_idx}")
             return
 
         # TODO: Instead of discretely updating the meshes for the fieldlines and magnetogram, it would be better to just
