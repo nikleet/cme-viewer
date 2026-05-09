@@ -1,21 +1,31 @@
 # scene_manager.py
 
 from __future__ import annotations
+import gc
 from typing import Optional
 from pyvisual.core.plot3d import Plot3d
 import pyvista as pv
 import numpy as np
 from pathlib import Path
 import datetime as dt
+import json
+import matplotlib.colors as mcolors
 
 # PSI imports
-from mapflpy.scripts import run_forward_tracing
-from mapflpy.utils import fetch_default_launch_points
+from mapflpy.scripts import run_fwdbwd_tracing
 from psi_io import read_hdf_by_index
+from mapflpy.utils import get_fieldline_polarity
 
 # Local imports
 from config import SimulationConfig
 import utils
+from pyvisual.core._styling import (
+    RANDOM_COLORING_DEFAULTS,
+    FL_POLARITY_COLORING_DEFAULTS,
+    FIELDLINE_KWARGS,
+)
+
+
 
 class SceneManager:
     def __init__(self, cfg: SimulationConfig, cache_dir: str = ".cache", **kwargs):
@@ -23,15 +33,15 @@ class SceneManager:
         self.data_dir: Path = cfg.data_dir
         mtime = int(self.data_dir.stat().st_mtime)
         self.run_id = f"{self.data_dir.name}_{mtime}"
-        
+
         print(self.data_dir)
         self.mag_files_list = utils.get_mag_files(self.data_dir)
-        
+
         self.t0 = None
         if cfg.t0:
-            dt_obj = dt.strptime(cfg.t0, '%m/%d/%y %H:%M:%S')
+            dt_obj = dt.datetime.strptime(cfg.t0, '%m/%d/%y %H:%M:%S')
             self.t0 = utils.round_seconds(dt_obj)
-        
+
         self.ut_datetimes = None
         time_path = self.data_dir / cfg.time_file
         if time_path.exists():
@@ -40,102 +50,153 @@ class SceneManager:
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._check_manifest()
         self.plotter = Plot3d(**kwargs)
-        
+
         self.actors = {}
         self.total_frames = len(self.mag_files_list)
-        
-        
-    def initialize(self, initial_frame=0):
-        """Creates the initial actors and saves them to the cache."""
-        # Create field line and magnetogram actors
-        fl_actor, mgram_actor = self._make_sun_actors(self.plotter, self.mag_files_list[initial_frame])
 
-        if fl_actor:
-            self.actors["fl"] = fl_actor
+        # Coloring config persists across frame updates and is applied by set_frame
+        self.fl_coloring_config: dict = {
+            'coloring': getattr(cfg, 'fl_coloring', 'random'),
+            'kwargs': getattr(cfg, 'fl_coloring_kwargs', {}),
+        }
+        
+        
+    def initialize(self, initial_frame: int = 0):
+        """Creates the initial actors and saves their meshes to the cache."""
+        
+        print("Processing initial frame...")
+        mgram_actor = self._make_mgram_actor(self.mag_files_list[initial_frame])
         if mgram_actor:
-            self.actors["mgram"] = mgram_actor
-            
-        # Cache actors for the initial frame
-        for key, actor in self.actors.items():
-            path = self.cache_dir / f"frame_{initial_frame:04d}_{key}_{self.run_id}.vtp"
-            self._save_actor_mesh(actor, path)
+            self.actors['mgram'] = mgram_actor
+            mgram_path = self.cache_dir / f'frame_{(initial_frame+1):04d}_mgram_{self.run_id}.vtp'
+            self._save_actor_mesh(mgram_actor, mgram_path)
+
+        # One actor per LP group; meshes are saved inside _make_fl_actors
+        for group_label, actor in self._make_fl_actors(initial_frame).items():
+            self.actors[f'fl_{group_label}'] = actor
         
 
     def preload_all_frames(self):
-        """
-        Precomputes meshes and saves them to disk.
-        Skips frames that have already been cached.
+        """Precomputes and caches per-group fieldline and magnetogram meshes.
+
+        Skips any frame/group combination that is already cached.  A temporary
+        off-screen plotter is used to build each fieldline mesh via
+        :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines` so that both
+        ``'line_index'`` and ``'polarity'`` scalar arrays are embedded
+        consistently across all frames.
         """
         print(f"Checking cache for {self.total_frames} frames...")
 
-        for frame_idx, mag_files in enumerate(self.mag_files_list):
+        for frame_idx in range(self.total_frames):
             
-            fl_path = self.cache_dir / f"frame_{frame_idx:04d}_fl_{self.run_id}.vtp"
-            mgram_path = self.cache_dir / f"frame_{frame_idx:04d}_mgram_{self.run_id}.vtp"
+            r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
 
-            if fl_path.exists() and mgram_path.exists():
+            fl_paths = {
+                label: self.cache_dir / f'frame_{(frame_idx+1):04d}_fl_{label}_{self.run_id}.vtp'
+                for label in group_labels
+            }
+            mgram_path = self.cache_dir / f'frame_{(frame_idx+1):04d}_mgram_{self.run_id}.vtp'
+
+            if all(p.exists() for p in fl_paths.values()) and mgram_path.exists():
                 continue
 
-            print(f"Processing and caching frame {frame_idx}...")
-            
-            # Read hdf data
-            values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
-            # Make magnetogram mesh
-            mgram_mesh = utils.create_mgram_mesh(r, t, p, values, frame='rtp')
-            
-            # Make fieldline mesh
-            # TODO: Improve launch points generation with functions to make launch points and traces
-            lps = fetch_default_launch_points(30)
-            traces = run_forward_tracing(*mag_files, launch_points=lps)
-            trace_geometry = traces.geometry
-            mask = trace_geometry[:, 0, :] > 100
-            a = np.where(mask[:, None, :], np.nan, trace_geometry)
-            trace_r, trace_t, trace_p = (a[:, i, :] for i in range(3))
-            fl_mesh = utils.create_fieldline_mesh(trace_r, trace_t, trace_p, frame='rtp')
-            
-            mgram_mesh.save(mgram_path)
-            fl_mesh.save(fl_path)
-            
-            # LAZY ACTOR-BASED IMPLEMENTATION
-            # # Note: Ideally, we bypass creating actors here entirely and just generate the pyvisual.DataSet directly. 
-            # print(f"Processing and caching frame {frame_idx}...")
-            # temp_plotter = Plot3d(off_screen=True)
-            # temp_fl, temp_mgram = self._make_sun_actors(temp_plotter, mag_files)
-            # # Extract and save the meshes to disk
-            # self._save_actor_mesh(temp_fl, fl_path)
-            # self._save_actor_mesh(temp_mgram, mgram_path)
-            # temp_plotter.close()
+            print(f"Processing frame {(frame_idx+1)}...")
+
+            if not mgram_path.exists():
+                values, r, t, p = read_hdf_by_index(self.mag_files_list[frame_idx][0], 0, None, None)
+                utils.create_mgram_mesh(r, t, p, values, frame='rtp').save(mgram_path)
+
+            for group_label, r_lp, t_lp, p_lp in zip(group_labels, r_groups, t_groups, p_groups):
+                fl_path = fl_paths[group_label]
+                if fl_path.exists():
+                    continue
+
+                r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
+                    frame_idx, (r_lp, t_lp, p_lp)
+                )
+                # Temporary off-screen plotter ensures the mesh is built with the
+                # same internal structure as the live actors
+                temp_plotter = Plot3d(off_screen=True)
+                temp_actor = temp_plotter.add_fieldlines(
+                    r_tr, t_tr, p_tr,
+                    coloring='random',
+                    dataid='line_index',
+                )
+                temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
+                self._save_actor_mesh(temp_actor, fl_path)
+                temp_plotter.close()
+
 
         print("Caching complete.")
 
     
     def set_frame(self, frame_idx: int):
-        """
-        Generically updates all registered actors by reading from disk.
+        """Updates all registered actors by loading their meshes from cache.
+
+        After updating geometry via ``copy_from``, coloring is explicitly
+        re-applied from :attr:`fl_coloring_config` to ensure it persists
+        regardless of any mapper state reset.
         """
         if not (0 <= frame_idx < self.total_frames):
             return
 
         for key, actor in self.actors.items():
-            path = self.cache_dir / f"frame_{frame_idx:04d}_{key}_{self.run_id}.vtp"
-            
+            path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
             if path.exists():
-                # Read the new geometry from disk
                 new_mesh = pv.read(path)
-                
-                # Update the existing actor's dataset in-place.
                 actor.mapper.dataset.copy_from(new_mesh)
-                
-                # Notify the mapper that the data has changed
                 actor.mapper.dataset.Modified()
             else:
-                print(f"Warning: Cache missing for frame {frame_idx}, component '{key}'")
+                print(f"Warning: cache missing for frame {frame_idx}, component '{key}'")
 
-        # Re-render the scene once after all actors are updated
+        # Re-apply coloring to FL actors after geometry update
+        for key, actor in self.actors.items():
+            if key.startswith('fl_'):
+                self._apply_coloring_to_actor(
+                    actor,
+                    self.fl_coloring_config['coloring'],
+                    **self.fl_coloring_config['kwargs'],
+                )
+
         self.plotter.render()
 
-    
+
+    def apply_fl_coloring(self, coloring: str | None,
+                           group_label: str | None = None, **kwargs):
+        """Update fieldline coloring for one or all groups.
+
+        Stores the new configuration in :attr:`fl_coloring_config` so it
+        persists across subsequent calls to :meth:`set_frame`, then applies
+        the settings to the relevant actors immediately.
+
+        Parameters
+        ----------
+        coloring : str | None
+            Coloring mode: ``'random'``, ``'polarity'``, or ``None`` for a
+            solid color.  See
+            :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines` for details.
+        group_label : str | None, optional
+            If given, only the actor for that group is updated.  If ``None``
+            all fieldline actors are updated.  Default is ``None``.
+        **kwargs
+            Forwarded to :meth:`_apply_coloring_to_actor`.  Useful overrides:
+            ``color``, ``opacity``, ``line_width``, ``cmap``.
+        """
+        self.fl_coloring_config = {'coloring': coloring, 'kwargs': kwargs}
+
+        fl_actors = {k: v for k, v in self.actors.items() if k.startswith('fl_')}
+        if group_label is not None:
+            key = f'fl_{group_label}'
+            fl_actors = {key: fl_actors[key]} if key in fl_actors else {}
+
+        for actor in fl_actors.values():
+            self._apply_coloring_to_actor(actor, coloring, **kwargs)
+
+        self.plotter.render()
+        
+        
     def get_frame_time(self, frame_idx: int) -> Optional[dt.datetime]:
         """
             Utility to get the simulation time corresponding to the given frame index. 
@@ -147,16 +208,76 @@ class SceneManager:
             return None
         return self.ut_datetimes[frame_idx]
     
+    
     def clear_cache(self, all_runs: bool = False):
         """Deletes cached files."""
         if all_runs:
-            # Delete everything in .cache
             for f in self.cache_dir.glob("*.vtp"):
                 f.unlink()
+            for f in self.cache_dir.glob("*.dat"):
+                f.unlink()
+            manifest_path = self.cache_dir / 'manifest.json'
+            if manifest_path.exists():
+                manifest_path.unlink()
         else:
-            # Delete only files matching the current run_id
             for f in self.cache_dir.glob(f"*{self.run_id}*"):
                 f.unlink()
+    
+    
+    def set_actor_property(self, actor_key: str, **props):
+        """Set visual properties on a named actor.
+
+        Provides a uniform interface for the UI layer to update actor
+        appearance without requiring direct access to the actor object.
+
+        Parameters
+        ----------
+        actor_key : str
+            Key in :attr:`actors`, e.g. ``'fl_cme'`` or ``'mgram'``.
+        **props
+            Supported: ``visibility`` (bool), ``opacity`` (float 0–1),
+            ``line_width`` (float), ``color`` (any PyVista-compatible color).
+        """
+        actor = self.actors.get(actor_key)
+        if actor is None:
+            print(f"Warning: no actor found with key '{actor_key}'.")
+            return
+
+        for prop, value in props.items():
+            match prop:
+                case 'visibility':
+                    actor.visibility = value
+                case 'opacity':
+                    actor.prop.opacity = value
+                case 'line_width':
+                    actor.prop.line_width = value
+                case 'color':
+                    actor.prop.color = value
+                case _:
+                    print(f"Warning: unknown actor property '{prop}'.")
+
+        self.plotter.render()
+        
+    
+    # ------------------------------------------------------------------ #
+    # Private helpers                                                    #
+    # ------------------------------------------------------------------ #
+    def _check_manifest(self):
+        """Checks the cache manifest against the current run. Clears the cache if stale."""
+        manifest_path = self.cache_dir / 'manifest.json'
+        manifest = {'data_dir': str(self.data_dir), 'run_id': self.run_id}
+
+        if manifest_path.exists():
+            with open(manifest_path, 'r') as f:
+                cached_manifest = json.load(f)
+            if cached_manifest == manifest:
+                return  # Cache is valid, nothing to do
+            print("Cache manifest mismatch — clearing stale cache.")
+            self.clear_cache(all_runs=True)
+
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+            
     
     def _save_actor_mesh(self, actor: pv.Actor, path: Path):
         """Utility to save an actor's mesh to disk."""
@@ -164,34 +285,362 @@ class SceneManager:
             actor.mapper.dataset.save(path)
 
     
-    def _make_sun_actors(self, plotter: Plot3d, mag_files: list[str]):
-        """Internal helper to generate actors from raw data."""
+    
+    def _make_mgram_actor(self, mag_files: list[str]) -> pv.Actor:
+        """Creates and returns the magnetogram actor."""
         values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
-        # TODO: Add appearance settings to config and pass here instead of hardcoding
-        mgram_actor = plotter.add_2d_slice(r, t, p, values, 
-                                           dataid="Magnetogram", 
-                                           clim=(-1e1, 1e1), 
-                                           cmap="seismic")
+        # TODO: Move appearance settings to cfg
+        return self.plotter.add_2d_slice(r, t, p, values,
+                                          dataid='Magnetogram',
+                                          clim=(-1e1, 1e1),
+                                          cmap='seismic')
 
-        # TODO: Improve launch points generation with functions to make launch points and traces
-        # TODO: Add launch point settings to config and pass here instead of hardcoding
-        lps = fetch_default_launch_points(30)
-        traces = run_forward_tracing(*mag_files, launch_points=lps)
-        trace_geometry = traces.geometry
-        mask = trace_geometry[:, 0, :] > 100
-        a = np.where(mask[:, None, :], np.nan, trace_geometry)
-        trace_r, trace_t, trace_p = (a[:, i, :] for i in range(3))
 
-        fl_actor = plotter.add_fieldlines(
-            trace_r,
-            trace_t,
-            trace_p,
-            coloring="random",
-            cmap="hsv",
-            n_colors=256,
-            line_width=1,
+    def _get_lps_for_frame(self, frame_idx: int
+                            ) -> tuple[list, list, list, list[str]]:
+        """Returns grouped launch points for the given frame.
+
+        Reads tracer positions and labels for ``frame_idx``, applies
+        label-based grouping and cadence downsampling via :meth:`_make_lps`,
+        and returns one set of launch point coordinates per selected label
+        group.
+
+        Parameters
+        ----------
+        frame_idx : int
+            Frame index.
+
+        Returns
+        -------
+        r_groups, t_groups, p_groups : list[np.ndarray]
+            Launch point coordinate arrays, one per group.
+        group_labels : list[str]
+            Label name for each group.
+        """
+        tracers, labels = self._get_tracers(frame_idx)
+        return self._make_lps(tracers, labels, return_groups=True)
+    
+    
+    def _make_fl_actors(self, frame_idx: int) -> dict[str, pv.Actor]:
+        """Creates one fieldline actor per launch point group.
+
+        For each group returned by :meth:`_get_lps_for_frame`, field lines are
+        traced and an actor is created via
+        :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines`.  Both
+        ``'line_index'`` (random coloring) and ``'polarity'`` scalar arrays are
+        embedded in the mesh before saving to the VTP cache, so that
+        :meth:`apply_fl_coloring` can switch between modes without re-tracing.
+
+        Parameters
+        ----------
+        frame_idx : int
+
+        Returns
+        -------
+        dict[str, pv.Actor]
+            Mapping of group label → fieldline actor.
+        """
+        r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
+        coloring = self.fl_coloring_config['coloring']
+        coloring_kwargs = self.fl_coloring_config['kwargs']
+
+        fl_actors = {}
+        for group_label, r_lp, t_lp, p_lp in zip(group_labels, r_groups, t_groups, p_groups):
+            fl_path = self.cache_dir / f'frame_{(frame_idx+1):04d}_fl_{group_label}_{self.run_id}.vtp'
+
+            if fl_path.exists():
+                mesh = pv.read(fl_path)
+                actor = self.plotter.add_mesh(
+                    mesh, **self._fl_plot_kwargs(coloring, **coloring_kwargs)
+                )
+            else:
+                r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
+                    frame_idx, (r_lp, t_lp, p_lp)
+                )
+                actor = self.plotter.add_fieldlines(
+                    r_tr, t_tr, p_tr,
+                    coloring='random',
+                    dataid='line_index',
+                )
+                # Embed polarity alongside random index so both coloring modes
+                # are available without re-tracing
+                actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
+                self._save_actor_mesh(actor, fl_path)
+
+                # If the requested coloring isn't random, apply it now
+                if coloring != 'random':
+                    self._apply_coloring_to_actor(actor, coloring, **coloring_kwargs)
+
+            fl_actors[group_label] = actor
+        return fl_actors
+    
+    
+    def _trace_fieldlines(self, frame_idx: int,
+                        lps: tuple[np.ndarray, np.ndarray, np.ndarray]
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Traces field lines from launch points and computes polarity.
+
+        Uses :func:`~mapflpy.scripts.run_fwdbwd_tracing` so that every
+        fieldline has endpoints on both boundaries, enabling polarity
+        classification via :func:`~mapflpy.utils.get_fieldline_polarity`.
+        Polarity is computed from the **unmasked** traces, then escapees
+        (r > 100) are set to NaN in the returned geometry arrays.
+
+        Parameters
+        ----------
+        frame_idx : int
+            Selects the magnetogram files to trace through.
+        lps : tuple[np.ndarray, np.ndarray, np.ndarray]
+            Launch point coordinates ``(r, theta, phi)``.
+
+        Returns
+        -------
+        r_tr, t_tr, p_tr : np.ndarray
+            Traced field line coordinates with escapees set to NaN.
+        polarity : np.ndarray
+            Integer polarity label per fieldline, shape ``(N,)``.
+            See :class:`~mapflpy.globals.Polarity` for the five states.
+        """
+        mag_files = self.mag_files_list[frame_idx]
+        br_filepath = mag_files[0]
+        traces = run_fwdbwd_tracing(*mag_files, launch_points=lps, timeout=600)
+
+        r_inner = getattr(self.cfg, 'r_inner', 1.0)
+        r_outer = getattr(self.cfg, 'r_outer', 30.0)
+
+        polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, traces)
+        
+        # Mask escapees after polarity is computed — polarity needs clean endpoints
+        geometry = traces.geometry  # (M, 3, N)
+        mask = geometry[:, 0, :] > 100
+        geometry = np.where(mask[:, None, :], np.nan, geometry)
+        return geometry[:, 0, :], geometry[:, 1, :], geometry[:, 2, :], polarity
+    
+
+    def _fl_plot_kwargs(self, coloring: str | None, **kwargs) -> dict:
+        """Translates a coloring mode into kwargs for :meth:`pyvista.Plotter.add_mesh`.
+
+        Used when adding a pre-built mesh loaded from cache rather than going
+        through :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines`.  Mirrors
+        the preset merging that ``add_fieldlines`` applies internally.
+
+        Parameters
+        ----------
+        coloring : str | None
+        **kwargs
+            Additional overrides merged on top of the preset.
+
+        Returns
+        -------
+        dict
+        """
+        match coloring:
+            case 'random':
+                return RANDOM_COLORING_DEFAULTS | {
+                    'scalars': 'line_index',
+                    'clim': (0, 255),
+                    'n_colors': 256,
+                } | kwargs
+            case 'polarity':
+                return FL_POLARITY_COLORING_DEFAULTS | FIELDLINE_KWARGS | {
+                    'scalars': 'polarity'
+                } | kwargs
+            case _:
+                return kwargs
+            
+    
+    def _apply_coloring_to_actor(self, actor: pv.Actor,
+                                coloring: str | None, **kwargs):
+        """Apply a coloring mode to an actor's mapper and render properties.
+
+        Called both from :meth:`apply_fl_coloring` (user-initiated) and from
+        :meth:`set_frame` (to re-assert config after ``copy_from``).
+
+        Parameters
+        ----------
+        actor : pv.Actor
+        coloring : str | None
+            ``'random'``, ``'polarity'``, or ``None`` for solid color.
+        **kwargs
+            Supports ``color``, ``opacity``, ``line_width``, ``cmap``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``coloring='polarity'`` but the mesh has no ``'polarity'`` array.
+            This means the cache predates polarity support — clear it and re-preload.
+        """
+        match coloring:
+            case 'random':
+                actor.mapper.scalar_visibility = True
+                actor.mapper.array_name = 'line_index'
+                actor.mapper.scalar_range = (0, 255)
+                actor.mapper.lookup_table = pv.LookupTable(
+                    cmap=kwargs.get('cmap', 'hsv'), n_values=256
+                )
+
+            case 'polarity':
+                if 'polarity' not in actor.mapper.dataset.cell_data.keys():
+                    raise RuntimeError(
+                        "No 'polarity' array found in the fieldline mesh. "
+                        "The cache was likely built before polarity support was added. "
+                        "Call clear_cache() and re-run preload_all_frames()."
+                    )
+                polarity_cmap = mcolors.ListedColormap(
+                    ['blue', 'grey', 'black', 'green', 'red']
+                )
+                lut = pv.LookupTable(cmap=polarity_cmap, n_values=5, scalar_range=(-2, 2))
+                actor.mapper.scalar_visibility = True
+                actor.mapper.array_name = 'polarity'
+                actor.mapper.scalar_range = (-2, 2)
+                actor.mapper.lookup_table = lut
+
+            case _:
+                # Solid color
+                actor.mapper.scalar_visibility = False
+                if 'color' in kwargs:
+                    actor.prop.color = kwargs['color']
+
+        if 'opacity' in kwargs:
+            actor.prop.opacity = kwargs['opacity']
+        if 'line_width' in kwargs:
+            actor.prop.line_width = kwargs['line_width']
+            
+            
+    def _get_tracers(self, frame_idx: int):
+        hdf_filename = f'{self.data_dir}/{self.cfg.tracer_prefix}{(frame_idx+1):06d}.hdf'
+        # try to read tracer data
+        try:
+            r, theta, phi = utils.read_tracers(hdf_filename)
+        except:
+            print('could not get tracers from {}'.format(hdf_filename))
+            raise
+
+        labels = utils.read_labels('{}/{}'.format(self.data_dir, self.cfg.tracer_header))
+        print('number of labels:{}'.format(len(labels)))
+        return (r, theta, phi), labels
+    
+    
+    def _make_lps(self, tracers, labels, return_groups=False):
+        """Select and downsample tracer launch points by label group.
+
+        Optionally appends background launch points from :attr:`cfg.bg_lp`.
+        Tracers are grouped by unique label, downsampled to at most
+        ``cfg.max_traces`` per group via :func:`~utils.get_cadence`, and
+        filtered to only the labels listed in ``cfg.label_select``.
+
+        Parameters
+        ----------
+        tracers : tuple[np.ndarray, np.ndarray, np.ndarray]
+            Arrays of ``(r, theta, phi)`` tracer positions.
+        labels : list[str]
+            Label for each tracer point, in the same order as ``tracers``.
+        return_groups : bool, optional
+            If ``True``, return one entry per label group rather than
+            flattening into per-point arrays. Default is ``False``.
+
+        Returns
+        -------
+        r, theta, phi : np.ndarray
+            Selected tracer positions. If ``return_groups=True``, each is a
+            list of arrays (one per group); otherwise a single flat array.
+        labels : list[str] or np.ndarray
+            If ``return_groups=True``, one label string per group.
+            Otherwise, a flat array of per-point label strings.
+        """
+        
+        r_tr, theta_tr, phi_tr = tracers
+
+        # Append background launch points if specified in config
+        if self.cfg.bg_lp is not None:
+            r_bg, theta_bg, phi_bg = utils.read_lps(self.cfg.bg_lp)
+            r_tr = np.hstack((r_tr, r_bg))
+            theta_tr = np.hstack((theta_tr, theta_bg))
+            phi_tr = np.hstack((phi_tr, phi_bg))
+            labels.extend(len(phi_bg) * ['background'])
+            print('after adding background, number of labels:{}'.format(len(labels)))
+
+        # Get unique labels and mappings back to original indices
+        labels, label_ids, label_orig = np.unique(
+            np.array(labels),
+            return_index=True,
+            return_inverse=True,
         )
 
-        return fl_actor, mgram_actor
+        # For each unique label, select a cadence-downsampled subset of tracers
+        # and filter to only labels specified in cfg.label_select
+        r_group, theta_group, phi_group, label_group = [], [], [], []
+        for label_id, label in enumerate(labels):
+            group_ids = np.where(label_orig == label_id)[0]
+            if label not in ['background']:
+                group_ids = group_ids[::utils.get_cadence(group_ids, self.cfg.max_traces)]
+            # Filter to only labels specified in config: Check if the label contains any of the keywords listed 
+            # in self.cfg.label_select (from config)
+            if any(keyword in label for keyword in self.cfg.label_select):
+                r_group.append(r_tr[group_ids])
+                theta_group.append(theta_tr[group_ids])
+                phi_group.append(phi_tr[group_ids])
+                label_group.append(len(group_ids) * [label])
 
+        if return_groups:
+            # Return one label per group rather than one per tracer point
+            group_labels = [labels_of_group[0] for labels_of_group in label_group]
+            return r_group, theta_group, phi_group, group_labels
+
+        r_select = np.hstack(r_group)
+        theta_select = np.hstack(theta_group)
+        phi_select = np.hstack(phi_group)
+        label_select = np.hstack(label_group)
+
+        return r_select, theta_select, phi_select, label_select
     
+    
+    
+    def _cache_lps(self, frame_idx: int):
+        tracers, labels = self._get_tracers(frame_idx)
+        r_groups, theta_groups, phi_groups, group_labels = self._make_lps(
+            tracers, labels, return_groups=True
+        )
+        lp_fpath = self.cache_dir / f'lp_select_{(frame_idx+1):04d}_{self.run_id}.dat'
+        utils.write_lps(
+            lp_fpath,
+            np.hstack(r_groups),
+            np.hstack(theta_groups),
+            np.hstack(phi_groups),
+        )
+        label_fpath = self.cache_dir / 'tracer_header_select.dat'
+        if not label_fpath.exists():
+            utils.write_labels(label_fpath, group_labels)
+    
+    
+    # OBSOLETE
+    # def _make_sun_actors(self, plotter: Plot3d, mag_files: list[str]):
+    #     """Internal helper to generate actors from raw data."""
+    #     values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
+    #     # TODO: Add appearance settings to config and pass here instead of hardcoding
+    #     mgram_actor = plotter.add_2d_slice(r, t, p, values, 
+    #                                        dataid="Magnetogram", 
+    #                                        clim=(-1e1, 1e1), 
+    #                                        cmap="seismic")
+
+    #     # TODO: Improve launch points generation with functions to make launch points and traces
+    #     # TODO: Add launch point settings to config and pass here instead of hardcoding
+    #     lps = fetch_default_launch_points(30)
+    #     traces = run_fwdbwd_tracing(*mag_files, launch_points=lps)
+    #     trace_geometry = traces.geometry
+    #     mask = trace_geometry[:, 0, :] > 100
+    #     a = np.where(mask[:, None, :], np.nan, trace_geometry)
+    #     trace_r, trace_t, trace_p = (a[:, i, :] for i in range(3))
+
+    #     fl_actor = plotter.add_fieldlines(
+    #         trace_r,
+    #         trace_t,
+    #         trace_p,
+    #         coloring="random",
+    #         cmap="hsv",
+    #         n_colors=256,
+    #         line_width=1,
+    #     )
+
+    #     return fl_actor, mgram_actor
+

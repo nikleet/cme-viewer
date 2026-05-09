@@ -35,7 +35,7 @@ def setup_callbacks(state, ctrl, resources):
             
             # Update the label (Future timestamp code goes here!)
             # Example: state.frame_label = get_timestamp_for_frame(current_frame)
-            state.frame_label = f"Frame: {current_frame}"
+            state.frame_label = f"Frame: {current_frame + 1}"
             
             # Push the updated meshes to the browser renderer
             if ctrl.view_update:
@@ -52,7 +52,7 @@ def build_toolbar(state, ctrl, resources):
     state.total_frames = scene.total_frames if scene else 1
     state.current_frame = 0
     state.playing = False
-    state.frame_label = "Frame: 0"
+    state.frame_label = "Frame: 1"
     
     # Register callbacks
     setup_callbacks(state, ctrl, resources)

@@ -4,7 +4,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import yaml
 import argparse
-from typing import Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 
 CONFIG_FILE = Path("config.yaml")
 
@@ -37,7 +37,7 @@ class SimulationConfig:
     tracer_prefix: str = "tracers_pos"
     lp_prefix: Optional[str] = "lp_"
     bg_lp: Optional[str] = None
-    label_select: Optional[str] = "apex,axis,arcade,ring_lp_03,ring_lp_05, \
+    label_select: Union[str, List[str]] = "apex,axis,arcade,ring_lp_03,ring_lp_05, \
                                     ring_lp_07,ring_lp_09,ring_lp_11,ring_lp_13, \
                                     ring_lp_15,ring_lp_17,background"  
     max_traces: int = 50
@@ -52,9 +52,12 @@ class AppConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Converts to dict, casting Paths to strings for YAML."""
         def _serialize(obj):
-            if isinstance(obj, Path): return str(obj)
-            if isinstance(obj, dict): return {k: _serialize(v) for k, v in obj.items()}
-            if isinstance(obj, list): return [_serialize(v) for v in obj]
+            if isinstance(obj, Path): 
+                return str(obj)
+            if isinstance(obj, dict): 
+                return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list): 
+                return [_serialize(v) for v in obj]
             return obj
         return _serialize(asdict(self))
 
@@ -100,7 +103,8 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
                 cfg.runtime.port = None
                 cfg.runtime.open_browser = True
                 cfg.runtime.render_mode = "client"
-                cfg.runtime.offscreen = False
+                # cfg.runtime.offscreen = False
+                cfg.runtime.offscreen = True
             elif args.mode == "remote":
                 cfg.runtime.host = "127.0.0.1"
                 cfg.runtime.port = 8080
@@ -108,7 +112,7 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
                 cfg.runtime.render_mode = "server"
                 cfg.runtime.offscreen = True
                 cfg.runtime.still_ratio = 1.0
-                cfg.runtime.interactive_ratio = 0.8
+                cfg.runtime.interactive_ratio = 1.0
                 cfg.runtime.aa = 'ssaa'
                 cfg.runtime.multi_samples = 2
         
@@ -132,7 +136,18 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
         if hasattr(args, 'lp_prefix') and args.lp_prefix: cfg.sim.lp_prefix = args.lp_prefix
         
         # ... add remaining args as needed ...
-
+        
+        # Normalization 
+        if isinstance(cfg.sim.label_select, str):
+            # Split by comma, strip whitespace, and filter out empty strings
+            cfg.sim.label_select = [
+                item.strip() 
+                for item in cfg.sim.label_select.split(',') 
+                if item.strip()
+            ]
+        elif cfg.sim.label_select is None:
+            cfg.sim.label_select = []
+    
     return cfg
 
 
