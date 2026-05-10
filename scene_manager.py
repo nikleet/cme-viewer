@@ -29,10 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 class SceneManager:
-    def __init__(self, cfg: SceneConfig, cache_dir: str = ".cache", **kwargs):
+    def __init__(self, cfg: SceneConfig, cache_dir: str = ".cache", mode: str = "local", **kwargs):
         self.cfg: SceneConfig = cfg
+        self.mode = mode    # 'local' or 'remote'
         self.data_dir: Path = cfg.data_dir
-        self.ram_cache = {} # Will hold {frame_idx: {actor_key: pv.PolyData}}
         
         mtime = int(self.data_dir.stat().st_mtime)
         self.run_id = f"{self.data_dir.name}_{mtime}"
@@ -55,8 +55,10 @@ class SceneManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._check_manifest()
         self.plotter = Plot3d(**kwargs)
-
+        
         self.actors = {}
+        self.ram_cache = {} # Holds {frame_idx: {actor_key: pv.PolyData}}
+        
         self.total_frames = len(self.mag_files_list)
 
         # Coloring config persists across frame updates and is applied by set_frame
@@ -87,23 +89,11 @@ class SceneManager:
         # One actor per LP group; meshes are saved inside _make_fl_actors
         for group_label, actor in self._make_fl_actors(initial_frame).items():
             self.actors[f'fl_{group_label}'] = actor
-
     
-    def load_meshes_to_ram(self):
-        """Reads all cached .vtp files from disk into RAM for fast playback."""
-        logger.info("Loading meshes into RAM for playback...")
-        for frame_idx in range(self.total_frames):
-            self.ram_cache[frame_idx] = {}
-            for key in self.actors.keys():
-                path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
-                if path.exists():
-                    self.ram_cache[frame_idx][key] = pv.read(path)
-                else:
-                    logger.warning(f"Missing cache file for RAM load: {path}")
-                    
 
     def preload_all_frames(self):
-        """Precomputes and caches per-group fieldline and magnetogram meshes.
+        """Precomputes and caches per-group fieldline and magnetogram meshes, then loads them into RAM in remote mode
+        or creates all actors in local mode.
 
         Skips any frame/group combination that is already cached.  A temporary
         off-screen plotter is used to build each fieldline mesh via
@@ -153,8 +143,18 @@ class SceneManager:
                 temp_plotter.close()
 
         logging.info("Caching complete.")
-        self.load_meshes_to_ram()
-
+        
+        #  Reads all cached .vtp files from disk into RAM for fast playback.
+        logger.info("Loading meshes into RAM for playback...")
+        for frame_idx in range(self.total_frames):
+            self.ram_cache[frame_idx] = {}
+            for key in self.actors.keys():
+                path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
+                if path.exists():
+                    self.ram_cache[frame_idx][key] = pv.read(path)
+                else:
+                    logger.warning(f"Missing cache file for RAM load: {path}")
+    
 
     def set_view_update(self, fn):
         """Register the Trame view.update callback.
@@ -200,9 +200,7 @@ class SceneManager:
                     self.fl_coloring_config['coloring'],
                     **self.fl_coloring_config['kwargs'],
                 )
-
-        # Note: self.plotter.render() is called by server.py's registered view.update callback, so we just need to push the update there
-
+    
     
     def set_actor_property(self, actor_key: str, **props):
         """Set visual properties on a named actor.

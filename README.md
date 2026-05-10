@@ -27,3 +27,8 @@ http://localhost:8080
 ```bash
 python server.py --mode remote --data-dir /home/niklas/PSI/cmecme/cmecme_poly_part1_run1a_cme/cor_mhd
 ```
+
+For testing remote features, run:
+```bash
+ngrok http 8080
+```

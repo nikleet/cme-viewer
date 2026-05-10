@@ -8,12 +8,13 @@ import pyvista as pv
 from pathlib import Path
 
 from trame.app import get_server
-from trame.ui.vuetify3 import SinglePageLayout
+from trame.ui.vuetify3 import SinglePageWithDrawerLayout
 from pyvista.trame.ui import plotter_ui
 
 import config
 from scene_manager import SceneManager
 from ui import build_toolbar
+from ui import build_sidebar
 
 
 def parse_args():
@@ -89,7 +90,7 @@ def main():
     
     # Initialize Scene Manager
     if cfg.scene_cfg.data_dir and cfg.scene_cfg.data_dir.exists():
-        scene = SceneManager(cfg.scene_cfg, line_smoothing=True)
+        scene = SceneManager(cfg.scene_cfg, line_smoothing=True, mode=cfg.runtime_cfg.mode)
         logger.info("Initializing scene manager...")
     else:
         logger.critical(f"Data directory not found: {cfg.scene_cfg.data_dir}")
@@ -101,8 +102,6 @@ def main():
         scene.plotter.enable_anti_aliasing(cfg.runtime_cfg.aa, multi_samples=cfg.runtime_cfg.multi_samples)
     
     # Setup initial frame and preload
-    # TODO: Might want to preload asynchronously eventually so there's less 
-    # delay on startup, but for now, we load sequentially.
     scene.initialize()
     logger.info("Scene initialized.")
     scene.preload_all_frames()
@@ -118,18 +117,22 @@ def main():
     still_ratio = cfg.runtime_cfg.still_ratio
     interactive_ratio = cfg.runtime_cfg.interactive_ratio
     
-    with SinglePageLayout(server) as layout:
+    with SinglePageWithDrawerLayout(server) as layout:  # or SinglePageWithDrawerLayout
+        layout.drawer.width = 300
         with layout.toolbar:
-            build_toolbar(state, ctrl, resources)
+            build_toolbar(state, ctrl, resources)   # no duplicate hamburger inside
+        with layout.drawer:
+            build_sidebar(state, resources)
         with layout.content:
             view = plotter_ui(
-                scene.plotter, 
-                mode=cfg.runtime_cfg.render_mode, 
-                still_ratio=still_ratio, 
-                interactive_ratio=interactive_ratio
+                scene.plotter,
+                mode=cfg.runtime_cfg.render_mode, # Use runtime_cfg
+                still_ratio=still_ratio,
+                interactive_ratio=interactive_ratio,
             )
             ctrl.view_update = view.update
-            scene.set_view_update(ctrl.view_update)
+            scene.set_view_update(view.update)
+
 
     logger.info(f"Starting Trame server in {cfg.runtime_cfg.mode} mode...")
     server.start(
