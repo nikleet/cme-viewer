@@ -1,7 +1,6 @@
 # scene_manager.py
 
 from __future__ import annotations
-import gc
 from typing import Optional
 from pyvisual.core.plot3d import Plot3d
 import pyvista as pv
@@ -10,14 +9,15 @@ from pathlib import Path
 import datetime as dt
 import json
 import matplotlib.colors as mcolors
+import logging
 
 # PSI imports
 from mapflpy.scripts import run_fwdbwd_tracing
 from psi_io import read_hdf_by_index
-from mapflpy.utils import get_fieldline_polarity
+from mapflpy.utils import get_fieldline_polarity, fetch_default_launch_points
 
 # Local imports
-from config import SimulationConfig
+from config import SceneConfig
 import utils
 from pyvisual.core._styling import (
     RANDOM_COLORING_DEFAULTS,
@@ -25,12 +25,15 @@ from pyvisual.core._styling import (
     FIELDLINE_KWARGS,
 )
 
+logger = logging.getLogger(__name__)
 
 
 class SceneManager:
-    def __init__(self, cfg: SimulationConfig, cache_dir: str = ".cache", **kwargs):
-        self.cfg: SimulationConfig = cfg
+    def __init__(self, cfg: SceneConfig, cache_dir: str = ".cache", **kwargs):
+        self.cfg: SceneConfig = cfg
         self.data_dir: Path = cfg.data_dir
+        self.ram_cache = {} # Will hold {frame_idx: {actor_key: pv.PolyData}}
+        
         mtime = int(self.data_dir.stat().st_mtime)
         self.run_id = f"{self.data_dir.name}_{mtime}"
 
@@ -39,7 +42,7 @@ class SceneManager:
 
         self.t0 = None
         if cfg.t0:
-            dt_obj = dt.datetime.strptime(cfg.t0, '%m/%d/%y %H:%M:%S')
+            dt_obj = dt.datetime.strptime(cfg.t0, '%m/%d/%Y %H:%M:%S')
             self.t0 = utils.round_seconds(dt_obj)
 
         self.ut_datetimes = None
@@ -62,11 +65,19 @@ class SceneManager:
             'kwargs': getattr(cfg, 'fl_coloring_kwargs', {}),
         }
         
+        self._view_update_fn = None  # Registered by server.py after view is created
+        
+        
+    @property
+    def fl_group_labels(self) -> list[str]:
+        """Returns fieldline group labels derived from actor keys (e.g. 'fl_cme' --> 'cme')."""
+        return [key[3:] for key in self.actors if key.startswith('fl_')]
+        
         
     def initialize(self, initial_frame: int = 0):
         """Creates the initial actors and saves their meshes to the cache."""
         
-        print("Processing initial frame...")
+        logger.debug("Setting up initial scene...")
         mgram_actor = self._make_mgram_actor(self.mag_files_list[initial_frame])
         if mgram_actor:
             self.actors['mgram'] = mgram_actor
@@ -76,7 +87,20 @@ class SceneManager:
         # One actor per LP group; meshes are saved inside _make_fl_actors
         for group_label, actor in self._make_fl_actors(initial_frame).items():
             self.actors[f'fl_{group_label}'] = actor
-        
+
+    
+    def load_meshes_to_ram(self):
+        """Reads all cached .vtp files from disk into RAM for fast playback."""
+        logger.info("Loading meshes into RAM for playback...")
+        for frame_idx in range(self.total_frames):
+            self.ram_cache[frame_idx] = {}
+            for key in self.actors.keys():
+                path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
+                if path.exists():
+                    self.ram_cache[frame_idx][key] = pv.read(path)
+                else:
+                    logger.warning(f"Missing cache file for RAM load: {path}")
+                    
 
     def preload_all_frames(self):
         """Precomputes and caches per-group fieldline and magnetogram meshes.
@@ -87,7 +111,7 @@ class SceneManager:
         ``'line_index'`` and ``'polarity'`` scalar arrays are embedded
         consistently across all frames.
         """
-        print(f"Checking cache for {self.total_frames} frames...")
+        logger.debug(f"Preloading frames. Checking cache for {self.total_frames} frames...")
 
         for frame_idx in range(self.total_frames):
             
@@ -102,7 +126,7 @@ class SceneManager:
             if all(p.exists() for p in fl_paths.values()) and mgram_path.exists():
                 continue
 
-            print(f"Processing frame {(frame_idx+1)}...")
+            logger.info(f"Processing frame {(frame_idx+1)}...")
 
             if not mgram_path.exists():
                 values, r, t, p = read_hdf_by_index(self.mag_files_list[frame_idx][0], 0, None, None)
@@ -128,9 +152,21 @@ class SceneManager:
                 self._save_actor_mesh(temp_actor, fl_path)
                 temp_plotter.close()
 
+        logging.info("Caching complete.")
+        self.load_meshes_to_ram()
 
-        print("Caching complete.")
 
+    def set_view_update(self, fn):
+        """Register the Trame view.update callback.
+
+        Called once from server.py after :func:`plotter_ui` creates the view.
+        Replaces direct ``plotter.render()`` calls so that both local and remote
+        modes are handled correctly: in remote mode ``view.update()`` renders
+        server-side then pushes an image; in local mode it serializes VTK geometry
+        and pushes it to vtk.js without triggering a conflicting server-side render.
+        """
+        self._view_update_fn = fn
+    
     
     def set_frame(self, frame_idx: int):
         """Updates all registered actors by loading their meshes from cache.
@@ -145,11 +181,16 @@ class SceneManager:
         for key, actor in self.actors.items():
             path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
             if path.exists():
-                new_mesh = pv.read(path)
+                # Fetch the pre-loaded mesh from RAM
+                new_mesh = self.ram_cache.get(frame_idx, {}).get(key)
+                
+                # # Old code read from cache every time
+                # new_mesh = pv.read(path)
                 actor.mapper.dataset.copy_from(new_mesh)
                 actor.mapper.dataset.Modified()
+                actor.mapper.Modified()
             else:
-                print(f"Warning: cache missing for frame {frame_idx}, component '{key}'")
+                logger.warning(f"Warning: cache missing for frame {frame_idx}, component '{key}'")
 
         # Re-apply coloring to FL actors after geometry update
         for key, actor in self.actors.items():
@@ -160,8 +201,43 @@ class SceneManager:
                     **self.fl_coloring_config['kwargs'],
                 )
 
-        self.plotter.render()
+        # Note: self.plotter.render() is called by server.py's registered view.update callback, so we just need to push the update there
 
+    
+    def set_actor_property(self, actor_key: str, **props):
+        """Set visual properties on a named actor.
+
+        Provides a uniform interface for the UI layer to update actor
+        appearance without requiring direct access to the actor object.
+
+        Parameters
+        ----------
+        actor_key : str
+            Key in :attr:`actors`, e.g. ``'fl_cme'`` or ``'mgram'``.
+        **props
+            Supported: ``visibility`` (bool), ``opacity`` (float 0–1),
+            ``line_width`` (float), ``color`` (any PyVista-compatible color).
+        """
+        actor = self.actors.get(actor_key)
+        if actor is None:
+            logger.warning(f"Warning: no actor found with key '{actor_key}'.")
+            return
+
+        for prop, value in props.items():
+            match prop:
+                case 'visibility':
+                    actor.visibility = value
+                case 'opacity':
+                    actor.prop.opacity = value
+                case 'line_width':
+                    actor.prop.line_width = value
+                case 'color':
+                    actor.prop.color = value
+                case _:
+                    logger.warning(f"Warning: unknown actor property '{prop}'.")
+
+        self._push_update()     
+        
 
     def apply_fl_coloring(self, coloring: str | None,
                            group_label: str | None = None, **kwargs):
@@ -194,7 +270,29 @@ class SceneManager:
         for actor in fl_actors.values():
             self._apply_coloring_to_actor(actor, coloring, **kwargs)
 
-        self.plotter.render()
+        self._push_update()
+        
+        
+    
+    def set_mgram_style(self, cmap: str | None = None, clim: tuple | None = None) -> None:
+        """Updates the magnetogram actor's colormap and/or scalar range.
+
+        Parameters
+        ----------
+        cmap : str | None
+            Matplotlib colormap name.
+        clim : tuple[float, float] | None
+            ``(min, max)`` scalar range.
+        """
+        actor = self.actors.get('mgram')
+        if actor is None:
+            return
+        if cmap is not None:
+            lut = pv.LookupTable(cmap=cmap)
+            actor.mapper.lookup_table = lut
+        if clim is not None:
+            actor.mapper.scalar_range = clim
+        self._push_update()
         
         
     def get_frame_time(self, frame_idx: int) -> Optional[dt.datetime]:
@@ -212,6 +310,7 @@ class SceneManager:
     def clear_cache(self, all_runs: bool = False):
         """Deletes cached files."""
         if all_runs:
+            logger.debug("Clearing entire cache...")
             for f in self.cache_dir.glob("*.vtp"):
                 f.unlink()
             for f in self.cache_dir.glob("*.dat"):
@@ -220,48 +319,28 @@ class SceneManager:
             if manifest_path.exists():
                 manifest_path.unlink()
         else:
+            logger.debug(f"Clearing cache for run {self.run_id}...")
             for f in self.cache_dir.glob(f"*{self.run_id}*"):
                 f.unlink()
     
     
-    def set_actor_property(self, actor_key: str, **props):
-        """Set visual properties on a named actor.
-
-        Provides a uniform interface for the UI layer to update actor
-        appearance without requiring direct access to the actor object.
-
-        Parameters
-        ----------
-        actor_key : str
-            Key in :attr:`actors`, e.g. ``'fl_cme'`` or ``'mgram'``.
-        **props
-            Supported: ``visibility`` (bool), ``opacity`` (float 0–1),
-            ``line_width`` (float), ``color`` (any PyVista-compatible color).
-        """
-        actor = self.actors.get(actor_key)
-        if actor is None:
-            print(f"Warning: no actor found with key '{actor_key}'.")
-            return
-
-        for prop, value in props.items():
-            match prop:
-                case 'visibility':
-                    actor.visibility = value
-                case 'opacity':
-                    actor.prop.opacity = value
-                case 'line_width':
-                    actor.prop.line_width = value
-                case 'color':
-                    actor.prop.color = value
-                case _:
-                    print(f"Warning: unknown actor property '{prop}'.")
-
-        self.plotter.render()
-        
     
     # ------------------------------------------------------------------ #
     # Private helpers                                                    #
     # ------------------------------------------------------------------ #
+
+    def _push_update(self):
+        """Push the current scene state to the browser.
+
+        Falls back to ``plotter.render()`` during initialization (before
+        ``set_view_update`` has been called).
+        """
+        if self._view_update_fn is not None:
+            self._view_update_fn()
+        else:
+            self.plotter.render()
+    
+    
     def _check_manifest(self):
         """Checks the cache manifest against the current run. Clears the cache if stale."""
         manifest_path = self.cache_dir / 'manifest.json'
@@ -272,7 +351,7 @@ class SceneManager:
                 cached_manifest = json.load(f)
             if cached_manifest == manifest:
                 return  # Cache is valid, nothing to do
-            print("Cache manifest mismatch — clearing stale cache.")
+            logger.debug("Cache manifest mismatch. Clearing stale cache...")
             self.clear_cache(all_runs=True)
 
         with open(manifest_path, 'w') as f:
@@ -318,7 +397,12 @@ class SceneManager:
             Label name for each group.
         """
         tracers, labels = self._get_tracers(frame_idx)
-        return self._make_lps(tracers, labels, return_groups=True)
+        if tracers[0] is None:
+            logger.warning(f"No tracer data found for frame {frame_idx}. Falling back to default launch points.")
+            r_default, theta_default, phi_default = fetch_default_launch_points()
+            return r_default, theta_default, phi_default, ['default']
+
+        return self._make_lps_from_tracers(tracers, labels, return_groups=True)
     
     
     def _make_fl_actors(self, frame_idx: int) -> dict[str, pv.Actor]:
@@ -410,7 +494,7 @@ class SceneManager:
 
         polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, traces)
         
-        # Mask escapees after polarity is computed — polarity needs clean endpoints
+        # Mask escapees after polarity is computed so they don't affect the polarity classification
         geometry = traces.geometry  # (M, 3, N)
         mask = geometry[:, 0, :] > 100
         geometry = np.where(mask[:, None, :], np.nan, geometry)
@@ -481,11 +565,12 @@ class SceneManager:
 
             case 'polarity':
                 if 'polarity' not in actor.mapper.dataset.cell_data.keys():
-                    raise RuntimeError(
+                    logger.error(
                         "No 'polarity' array found in the fieldline mesh. "
-                        "The cache was likely built before polarity support was added. "
                         "Call clear_cache() and re-run preload_all_frames()."
                     )
+                    return
+                
                 polarity_cmap = mcolors.ListedColormap(
                     ['blue', 'grey', 'black', 'green', 'red']
                 )
@@ -509,19 +594,24 @@ class SceneManager:
             
     def _get_tracers(self, frame_idx: int):
         hdf_filename = f'{self.data_dir}/{self.cfg.tracer_prefix}{(frame_idx+1):06d}.hdf'
+        
         # try to read tracer data
         try:
             r, theta, phi = utils.read_tracers(hdf_filename)
-        except:
-            print('could not get tracers from {}'.format(hdf_filename))
-            raise
+        except Exception as e:
+            # We catch the error, log it, and return None to signal failure
+            logger.error(f'Could not find tracers in {hdf_filename}: {e}')
+            return (None, None, None), None
 
-        labels = utils.read_labels('{}/{}'.format(self.data_dir, self.cfg.tracer_header))
-        print('number of labels:{}'.format(len(labels)))
+        labels_path = f'{self.data_dir}/{self.cfg.tracer_header}'
+        labels = utils.read_labels(labels_path)
+    
+        logger.debug(f'Successfully loaded {len(labels)} labels.')
+            
         return (r, theta, phi), labels
     
     
-    def _make_lps(self, tracers, labels, return_groups=False):
+    def _make_lps_from_tracers(self, tracers, labels, return_groups=False):
         """Select and downsample tracer launch points by label group.
 
         Optionally appends background launch points from :attr:`cfg.bg_lp`.
@@ -558,7 +648,7 @@ class SceneManager:
             theta_tr = np.hstack((theta_tr, theta_bg))
             phi_tr = np.hstack((phi_tr, phi_bg))
             labels.extend(len(phi_bg) * ['background'])
-            print('after adding background, number of labels:{}'.format(len(labels)))
+            logger.debug('After adding background, number of labels:{}'.format(len(labels)))
 
         # Get unique labels and mappings back to original indices
         labels, label_ids, label_orig = np.unique(
@@ -598,7 +688,7 @@ class SceneManager:
     
     def _cache_lps(self, frame_idx: int):
         tracers, labels = self._get_tracers(frame_idx)
-        r_groups, theta_groups, phi_groups, group_labels = self._make_lps(
+        r_groups, theta_groups, phi_groups, group_labels = self._make_lps_from_tracers(
             tracers, labels, return_groups=True
         )
         lp_fpath = self.cache_dir / f'lp_select_{(frame_idx+1):04d}_{self.run_id}.dat'
@@ -611,36 +701,3 @@ class SceneManager:
         label_fpath = self.cache_dir / 'tracer_header_select.dat'
         if not label_fpath.exists():
             utils.write_labels(label_fpath, group_labels)
-    
-    
-    # OBSOLETE
-    # def _make_sun_actors(self, plotter: Plot3d, mag_files: list[str]):
-    #     """Internal helper to generate actors from raw data."""
-    #     values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
-    #     # TODO: Add appearance settings to config and pass here instead of hardcoding
-    #     mgram_actor = plotter.add_2d_slice(r, t, p, values, 
-    #                                        dataid="Magnetogram", 
-    #                                        clim=(-1e1, 1e1), 
-    #                                        cmap="seismic")
-
-    #     # TODO: Improve launch points generation with functions to make launch points and traces
-    #     # TODO: Add launch point settings to config and pass here instead of hardcoding
-    #     lps = fetch_default_launch_points(30)
-    #     traces = run_fwdbwd_tracing(*mag_files, launch_points=lps)
-    #     trace_geometry = traces.geometry
-    #     mask = trace_geometry[:, 0, :] > 100
-    #     a = np.where(mask[:, None, :], np.nan, trace_geometry)
-    #     trace_r, trace_t, trace_p = (a[:, i, :] for i in range(3))
-
-    #     fl_actor = plotter.add_fieldlines(
-    #         trace_r,
-    #         trace_t,
-    #         trace_p,
-    #         coloring="random",
-    #         cmap="hsv",
-    #         n_colors=256,
-    #         line_width=1,
-    #     )
-
-    #     return fl_actor, mgram_actor
-
