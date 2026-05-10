@@ -1,0 +1,3 @@
+[submodule "pyvisual"]
+	path = pyvisual
+	url = https://github.com/predsci/pyvisual

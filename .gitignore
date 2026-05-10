@@ -2,7 +2,6 @@
 obsolete-stuff/
 dat/
 .vscode/
-pyvisual/
 examples/
 config.yaml
 todo.md
