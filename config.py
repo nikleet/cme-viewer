@@ -86,8 +86,9 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
     Builds the final config. 
     Priority: CLI Args > YAML File > Defaults.
     """
+    config_exists = config_path.exists()
     # Start with defaults or load from YAML
-    if config_path.exists():
+    if config_exists:
         with open(config_path, "r") as f:
             cfg = AppConfig.from_dict(yaml.safe_load(f) or {})
     else:
@@ -106,7 +107,7 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
                 # cfg.runtime.offscreen = False
                 cfg.runtime_cfg.offscreen = True
             elif args.mode == "remote":
-                cfg.runtime_cfg.host = "0.0.0.0"
+                cfg.runtime_cfg.host = "127.0.0.1"
                 cfg.runtime_cfg.port = 8080
                 cfg.runtime_cfg.open_browser = False
                 cfg.runtime_cfg.render_mode = "server"
@@ -116,6 +117,8 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
                 cfg.runtime_cfg.aa = 'ssaa'
                 cfg.runtime_cfg.multi_samples = 2
         
+        # Server Args Overrides
+        if hasattr(args, 'host') and args.host: cfg.runtime_cfg.host = args.host
         if hasattr(args, 'port') and args.port: cfg.runtime_cfg.port = args.port
         if hasattr(args, 'still_ratio') and args.still_ratio: cfg.runtime_cfg.still_ratio = args.still_ratio
         if hasattr(args, 'interactive_ratio') and args.interactive_ratio: cfg.runtime_cfg.interactive_ratio = args.interactive_ratio
@@ -123,7 +126,7 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
         if hasattr(args, 'multi_samples') and args.multi_samples: cfg.runtime_cfg.multi_samples = args.multi_samples
         if hasattr(args, 'verbose') and args.verbose is not None: cfg.runtime_cfg.verbose = args.verbose
 
-        # Simulation Overrides
+        # Scene Args Overrides
         if hasattr(args, 'data_dir') and args.data_dir: cfg.scene_cfg.data_dir = Path(args.data_dir)
         if hasattr(args, 'max_traces') and args.max_traces: cfg.scene_cfg.max_traces = args.max_traces
         if hasattr(args, 'max_steps') and args.max_steps: cfg.scene_cfg.max_steps = args.max_steps
@@ -147,6 +150,9 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
             ]
         elif cfg.scene_cfg.label_select is None:
             cfg.scene_cfg.label_select = []
+    
+    if args and not config_exists:
+        cfg.save(config_path)
     
     return cfg
 

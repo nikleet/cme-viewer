@@ -30,16 +30,19 @@ def parse_args():
                    help="Directory containing magnetic field and tracer .hdf files.")
 
     # Server & Rendering
-    render_args = p.add_argument_group("Server & Render Settings")
-    render_args.add_argument("--port", type=int, default=None)
-    render_args.add_argument("--still-ratio", type=float, default=None, 
+    server_args = p.add_argument_group("Server & Render Settings")
+    server_args.add_argument("--port", type=int, default=None)
+    server_args.add_argument("--still-ratio", type=float, default=None, 
                         help="Render quality for still frames.")
-    render_args.add_argument("--interactive-ratio", type=float, default=None, 
+    server_args.add_argument("--interactive-ratio", type=float, default=None, 
                         help="Render quality for interactive frames.")
-    render_args.add_argument("--aa", choices=["ssaa", "fxaa", "msaa"], default=None, 
+    server_args.add_argument("--aa", choices=["ssaa", "fxaa", "msaa"], default=None, 
                         help="Enable anti-aliasing.")
-    render_args.add_argument("--multi-samples", type=int, default=None,
+    server_args.add_argument("--multi-samples", type=int, default=None,
                         help="Number of samples for MSAA.")
+    server_args.add_argument("--host", default="None",
+                        help="Interface to bind to. Default 127.0.0.1 (SSH tunnel access). "
+                        "Pass 0.0.0.0 to expose on all interfaces.")
 
     # Simulation & Time
     scene_args = p.add_argument_group("Scene Metadata")
@@ -49,20 +52,20 @@ def parse_args():
                      help="Initial time of simulation in 'mm/dd/yyyy HH:MM:SS' format.")
 
     # Tracer Settings
-    tracer = p.add_argument_group("Tracer & Fieldline Settings")
-    tracer.add_argument("--tracer-header", default=None,
+    fl_args = p.add_argument_group("Tracer & Fieldline Settings")
+    fl_args.add_argument("--tracer-header", default=None,
                         help="Name of tracer header file.")
-    tracer.add_argument("--tracer-prefix", default=None,
+    fl_args.add_argument("--tracer-prefix", default=None,
                         help="Prefix of input tracer files.")
-    tracer.add_argument("--lp-prefix", default=None,
+    fl_args.add_argument("--lp-prefix", default=None,
                         help="Prefix of output launch point files.")
-    tracer.add_argument("--max-traces", type=int, default=None,
+    fl_args.add_argument("--max-traces", type=int, default=None,
                         help="Max fieldlines per group.")
-    tracer.add_argument("--max-steps", type=int, default=None,
+    fl_args.add_argument("--max-steps", type=int, default=None,
                         help="Max number of steps to generate.")
-    tracer.add_argument("--label-select", default=None,
+    fl_args.add_argument("--label-select", default=None,
                         help="Comma-separated tracer labels for launch points.")
-    tracer.add_argument("--bg-lp", default=None,
+    fl_args.add_argument("--bg-lp", default=None,
                         help="Fixed points for background fieldlines.")
 
     # --- Debug ---
