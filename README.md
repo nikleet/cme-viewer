@@ -2,7 +2,7 @@
 
 An interactive 3D visualization tool for solar coronal mass ejection (CME) simulations. Built on [PyVista](https://pyvista.org) / Pyvisual, [Trame](https://kitware.github.io/trame/), and PSI's solar physics libraries (`mapflpy`, `psi_io`).
 
-The viewer streams a live 3D scene to a web browser, allowing navigation through simulation time steps, toggling of scene components, and control over magnetic field line rendering — either locally or from a remote headless server over an SSH tunnel.
+The viewer streams a live 3D scene to a web browser, allowing navigation through simulation time steps, toggling of scene components, and control over magnetic field line rendering.
 
 
 ## Table of Contents
@@ -19,20 +19,6 @@ The viewer streams a live 3D scene to a web browser, allowing navigation through
 - [Project Structure](#project-structure)
 
 
-## Architecture
-
-The application is split into three layers:
-
-| File | Role |
-|---|---|
-| `server.py` | Entry point. Parses arguments, wires up Trame layout and server. |
-| `scene_manager.py` | All data I/O, fieldline tracing, actor management, and cache logic. |
-| `ui.py` | Declarative Trame/Vuetify3 UI: toolbar, sidebar, state callbacks. |
-| `config.py` | Dataclass-based config with YAML file + CLI override resolution. |
-
-In **local mode**, rendering is done client-side by vtk.js running in the browser. In **remote mode**, PyVista renders server-side and streams images over a WebSocket — better for large datasets on powerful remote hardware.
-
-
 ## Requirements
 
 - Python 3.10+
@@ -42,7 +28,7 @@ In **local mode**, rendering is done client-side by vtk.js running in the browse
 - `psi_io`
 - `numpy`, `matplotlib`, `pyyaml`
 
-> PSI libraries (`mapflpy`, `psi_io`) are proprietary. Contact PSI for access.
+> PSI libraries (`mapflpy`, `psi_io`) are proprietary.
 
 
 ## Installation
@@ -107,10 +93,6 @@ python server.py --mode remote --data-dir /path/to/data --host 0.0.0.0
 
 
 ## Accessing Remotely via SSH Tunnel
-
-The recommended way to access a remote instance securely — no open ports, no domain, no TLS certificate required. All traffic, including the WebSocket stream, is carried over the encrypted SSH connection.
-
-### How it works
 
 The server binds to `127.0.0.1:8080` (localhost only), making it unreachable from the network. An SSH local port forward creates an encrypted tunnel from your machine's `localhost:8080` to the server's `localhost:8080`. You then access the app at `http://localhost:8080` in your browser as if it were running locally.
 
