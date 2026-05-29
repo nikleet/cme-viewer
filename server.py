@@ -29,8 +29,11 @@ def parse_args():
     p.add_argument("--data-dir", type=Path, required=True,
                    help="Directory containing magnetic field and tracer .hdf files.")
 
-    # Server & Rendering
+    # Server & Rendering Arguments
     server_args = p.add_argument_group("Server & Render Settings")
+    server_args.add_argument("--host", default=None,
+                        help="Interface to bind to. Default 127.0.0.1 (SSH tunnel access). "
+                        "Pass 0.0.0.0 to expose on all interfaces.")
     server_args.add_argument("--port", type=int, default=None)
     server_args.add_argument("--still-ratio", type=float, default=None, 
                         help="Render quality for still frames.")
@@ -40,18 +43,15 @@ def parse_args():
                         help="Enable anti-aliasing.")
     server_args.add_argument("--multi-samples", type=int, default=None,
                         help="Number of samples for MSAA.")
-    server_args.add_argument("--host", default="None",
-                        help="Interface to bind to. Default 127.0.0.1 (SSH tunnel access). "
-                        "Pass 0.0.0.0 to expose on all interfaces.")
 
-    # Simulation & Time
+    # Simulation & Time Arguments
     scene_args = p.add_argument_group("Scene Metadata")
     scene_args.add_argument("--time-file", default=None,
                      help="Name of file storing simulation time steps.")
     scene_args.add_argument("--t0", default=None,
                      help="Initial time of simulation in 'mm/dd/yyyy HH:MM:SS' format.")
 
-    # Tracer Settings
+    # Tracer Arguments
     fl_args = p.add_argument_group("Tracer & Fieldline Settings")
     fl_args.add_argument("--tracer-header", default=None,
                         help="Name of tracer header file.")
