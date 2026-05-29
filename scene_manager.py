@@ -65,6 +65,7 @@ class SceneManager:
         self.fl_coloring_config: dict = {
             'coloring': getattr(cfg, 'fl_coloring', 'random'),
             'kwargs': getattr(cfg, 'fl_coloring_kwargs', {}),
+            'per_group': {},   # group_label -> {'coloring': ..., 'kwargs': ...}
         }
         
         self._view_update_fn = None  # Registered by server.py after view is created
@@ -191,16 +192,18 @@ class SceneManager:
                 actor.mapper.Modified()
             else:
                 logger.warning(f"Warning: cache missing for frame {frame_idx}, component '{key}'")
-
-        # Re-apply coloring to FL actors after geometry update
+        
+        # Re-apply coloring to FL actors after geometry update.
+        per_group = self.fl_coloring_config.get('per_group', {})
         for key, actor in self.actors.items():
             if key.startswith('fl_'):
-                self._apply_coloring_to_actor(
-                    actor,
-                    self.fl_coloring_config['coloring'],
-                    **self.fl_coloring_config['kwargs'],
-                )
-    
+                group_label = key[3:]
+                if group_label in per_group:
+                    cfg = per_group[group_label]
+                else:
+                    cfg = self.fl_coloring_config
+                self._apply_coloring_to_actor(actor, cfg['coloring'], **cfg['kwargs'])
+
     
     def set_actor_property(self, actor_key: str, **props):
         """Set visual properties on a named actor.
@@ -240,11 +243,11 @@ class SceneManager:
     def apply_fl_coloring(self, coloring: str | None,
                            group_label: str | None = None, **kwargs):
         """Update fieldline coloring for one or all groups.
-
+ 
         Stores the new configuration in :attr:`fl_coloring_config` so it
         persists across subsequent calls to :meth:`set_frame`, then applies
         the settings to the relevant actors immediately.
-
+ 
         Parameters
         ----------
         coloring : str | None
@@ -258,18 +261,26 @@ class SceneManager:
             Forwarded to :meth:`_apply_coloring_to_actor`.  Useful overrides:
             ``color``, ``opacity``, ``line_width``, ``cmap``.
         """
-        self.fl_coloring_config = {'coloring': coloring, 'kwargs': kwargs}
-
-        fl_actors = {k: v for k, v in self.actors.items() if k.startswith('fl_')}
         if group_label is not None:
+            # Per-group override (custom color mode)
+            self.fl_coloring_config['per_group'][group_label] = {
+                'coloring': coloring,
+                'kwargs': kwargs,
+            }
             key = f'fl_{group_label}'
-            fl_actors = {key: fl_actors[key]} if key in fl_actors else {}
-
+            fl_actors = {key: self.actors[key]} if key in self.actors else {}
+        else:
+            # Global mode change (random / polarity)
+            self.fl_coloring_config['coloring'] = coloring
+            self.fl_coloring_config['kwargs'] = kwargs
+            self.fl_coloring_config['per_group'] = {}
+            fl_actors = {k: v for k, v in self.actors.items() if k.startswith('fl_')}
+ 
         for actor in fl_actors.values():
             self._apply_coloring_to_actor(actor, coloring, **kwargs)
-
+ 
         self._push_update()
-        
+
         
     
     def set_mgram_style(self, cmap: str | None = None, clim: tuple | None = None) -> None:

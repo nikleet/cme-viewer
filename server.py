@@ -118,7 +118,7 @@ def main():
     interactive_ratio = cfg.runtime_cfg.interactive_ratio
     
     with SinglePageWithDrawerLayout(server) as layout:  # or SinglePageWithDrawerLayout
-        layout.drawer.width = 300
+        layout.drawer.width = 350
         with layout.toolbar:
             build_toolbar(state, ctrl, resources)   # no duplicate hamburger inside
         with layout.drawer:

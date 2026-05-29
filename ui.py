@@ -27,6 +27,7 @@ def init_state(state, scene):
     state.current_frame  = 0
     state.playing        = False
     state.frame_label    = "Frame: 1"
+    state.time_label     = ""
     state.drawer         = False
     # open_panels controls which expansion panels start expanded.
     # Values match the `value=` prop on each VExpansionPanel below.
@@ -36,10 +37,16 @@ def init_state(state, scene):
     state.mgram_clim_min = -10.0
     state.mgram_clim_max =  10.0
     state.fl_coloring_mode = "random"
+    state.fl_global_line_width = 5.0
     if scene:
+        initial_time = scene.get_frame_time(0)
+        if initial_time:
+            state.time_label = initial_time.strftime("%Y-%m-%d %H:%M:%S")
         for i, label in enumerate(scene.fl_group_labels):
             state[f"fl_{label}_visible"] = True
             state[f"fl_{label}_color"]   = FL_DEFAULT_COLORS[i % len(FL_DEFAULT_COLORS)]
+            state[f"fl_{label}_opacity"] = 1.0
+            state[f"fl_{label}_line_width"] = 5.0
 
 
 # Callbacks
@@ -74,6 +81,13 @@ def setup_callbacks(state, ctrl, resources):
             if scene:
                 scene.set_frame(current_frame)
                 state.frame_label = f"Frame: {current_frame + 1}"
+                
+                frame_time = scene.get_frame_time(current_frame)
+                if frame_time:
+                    state.time_label = frame_time.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    state.time_label = "" 
+                
                 if ctrl.view_update:
                     ctrl.view_update()
         finally:
@@ -113,6 +127,18 @@ def setup_callbacks(state, ctrl, resources):
                 scene.apply_fl_coloring(None, group_label=label, color=color)
         else:
             scene.apply_fl_coloring(fl_coloring_mode)
+            
+    @state.change("fl_global_line_width")
+    def on_fl_global_line_width(fl_global_line_width, **kwargs):
+        if not scene:
+            return
+        try:
+            lw = float(fl_global_line_width)
+        except (TypeError, ValueError):
+            return
+        for label in scene.fl_group_labels:
+            state[f"fl_{label}_line_width"] = lw
+            scene.set_actor_property(f"fl_{label}", line_width=lw)
 
     if scene:
         for label in scene.fl_group_labels:
@@ -130,7 +156,18 @@ def _register_group_callbacks(state, scene, label: str):
         if state.fl_coloring_mode == "custom":
             scene.apply_fl_coloring(None, group_label=label,
                                     color=kwargs.get(f"fl_{label}_color", "#ffffff"))
-
+    
+    @state.change(f"fl_{label}_opacity")
+    def on_opacity(**kwargs):
+        scene.set_actor_property(f"fl_{label}", opacity=(kwargs.get(f"fl_{label}_opacity", 1)))
+            
+    @state.change(f"fl_{label}_line_width")
+    def on_line_width(**kwargs):
+        try:
+            line_width = float(kwargs.get(f"fl_{label}_line_width", 5.0))
+        except (TypeError, ValueError):
+            line_width = 5.0
+        scene.set_actor_property(f"fl_{label}", line_width=line_width)
 
 # Toolbar
 
@@ -146,6 +183,7 @@ def build_toolbar(state, ctrl, resources):
     with vuetify3.VBtn(icon=True, click="playing = !playing", variant="text", color="primary"):
         vuetify3.VIcon("{{ playing ? 'mdi-pause' : 'mdi-play' }}")
 
+    # Frame Slider
     vuetify3.VSlider(
         v_model=("current_frame", 0),
         min=0,
@@ -155,7 +193,23 @@ def build_toolbar(state, ctrl, resources):
         density="compact",
         style="max-width: 400px; margin: 0 16px;",
     )
-    vuetify3.VChip("{{ frame_label }}", variant="outlined", size="small", color="secondary")
+    # Frame Chip
+    vuetify3.VChip("{{ frame_label }}", 
+                   variant="outlined", 
+                   size="small", 
+                   color="secondary",
+                   classes='me-3')
+    
+    # Time/Date Chip
+    vuetify3.VChip(
+        "{{ time_label }}",
+        v_show="time_label",         # Only visible when time_label string isn't empty
+        prepend_icon="mdi-calendar-clock", 
+        variant="tonal", 
+        size="small", 
+        color="info"
+    )
+    
     vuetify3.VSpacer()
 
 
@@ -221,6 +275,7 @@ def _build_mgram_panel():
 def _build_fl_panel(scene):
     with vuetify3.VExpansionPanel(value="fl", title="Field Lines"):
         with vuetify3.VExpansionPanelText():
+            # Coloring Mode Buttons
             vuetify3.VLabel("Coloring Mode", classes="text-caption text-medium-emphasis")
             with vuetify3.VBtnToggle(
                 v_model=("fl_coloring_mode", "random"),
@@ -234,10 +289,30 @@ def _build_fl_panel(scene):
                 vuetify3.VBtn("Random",   value="random",   style="flex:1;")
                 vuetify3.VBtn("Polarity", value="polarity", style="flex:1;")
                 vuetify3.VBtn("Custom",   value="custom",   style="flex:1;")
-
+            
+            # Global Line Width
+            vuetify3.VDivider(classes="mb-2")
+            vuetify3.VLabel("Global Width", classes="text-caption text-medium-emphasis mb-1")
+            
+            with vuetify3.VRow(align="center", no_gutters=True, classes="mb-4"):
+                with vuetify3.VCol(style="flex-grow: 1;"):
+                    vuetify3.VSlider(
+                        v_model=("fl_global_line_width", 5.0),
+                        min=1.0, max=20.0, step=0.5,
+                        hide_details=True, density="compact",
+                    )
+                with vuetify3.VCol(cols="auto", classes="ps-3"):
+                    vuetify3.VTextField(
+                        v_model=("fl_global_line_width", 5.0),
+                        density="compact", style="width: 45px;",
+                        type="number", variant="plain", hide_details=True,
+                    )
+            
+            # Groups Label
             if scene and scene.fl_group_labels:
                 vuetify3.VLabel("Groups", classes="text-caption text-medium-emphasis")
                 vuetify3.VDivider(classes="mt-1 mb-1")
+                # Build FL Group Rows
                 for i, label in enumerate(scene.fl_group_labels):
                     _build_fl_group_row(label, FL_DEFAULT_COLORS[i % len(FL_DEFAULT_COLORS)])
 
@@ -245,29 +320,68 @@ def _build_fl_panel(scene):
 def _build_fl_group_row(label: str, default_color: str):
     with vuetify3.VRow(
         align="center", no_gutters=True, classes="py-1",
-        style="border-bottom: 1px solid rgba(128,128,128,0.15);",
+        style="border-bottom: 1px solid rgba(128,128,128,0.15); flex-wrap: nowrap;",
     ):
-        with vuetify3.VCol(style="min-width:0; overflow:hidden;"):
+        # Label Column
+        with vuetify3.VCol(style="min-width: 0; flex-grow: 1; flex-shrink: 1; overflow: hidden;"):
             html.Span(
                 label, classes="text-body-2",
-                style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:block;",
-            )
+                style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;",
+            )  
 
-        with vuetify3.VCol(cols="auto"):
-            vuetify3.VSwitch(
-                v_model=(f"fl_{label}_visible", True),
-                color="primary", density="compact", hide_details=True,
-            )
-
-        with vuetify3.VCol(cols="auto", v_show="fl_coloring_mode === 'custom'"):
+        # Color Picker
+        with vuetify3.VCol(cols="auto", classes="px-1", v_show=f"fl_coloring_mode === 'custom' && fl_{label}_visible === true"):
             with vuetify3.VMenu(close_on_content_click=False):
                 with vuetify3.Template(v_slot_activator="{ props }"):
                     with vuetify3.VBtn(v_bind="props", icon=True, size="small", variant="text"):
-                        # VIcon color bound to the group's color state key
                         vuetify3.VIcon("mdi-circle", color=(f"fl_{label}_color", default_color))
                 vuetify3.VColorPicker(
                     v_model=(f"fl_{label}_color", default_color),
-                    modes=["hex"],
-                    show_swatches=False,
-                    width=280,
+                    modes=["hex"], show_swatches=False, width=280,
                 )
+
+        # Options Cog
+        with vuetify3.VCol(cols="auto", classes="px-1", v_show=f"fl_{label}_visible"):
+            with vuetify3.VMenu(close_on_content_click=False, location="bottom end"):
+                with vuetify3.Template(v_slot_activator="{ props }"):
+                    with vuetify3.VBtn(v_bind="props", icon="mdi-cog", size="small", variant="text", color="grey"):
+                        pass
+                with vuetify3.VCard(classes="pa-4", style="min-width: 300px;"):
+                    html.Div("Field Line Options", classes="text-subtitle-2 mb-2")
+                    with vuetify3.VSlider(
+                        v_model=(f"fl_{label}_opacity", 1.0),
+                        label="Opacity", min=0.0, max=1.0, step=0.05, hide_details=True, density="compact"
+                    ):
+                        with vuetify3.Template(v_slot_append=True):
+                            vuetify3.VTextField(
+                                v_model=(f"fl_{label}_opacity", 1.0),
+                                density="compact", style="width: 65px", type="number", variant="plain", hide_details=True
+                            )
+                    
+                    with vuetify3.VSlider(
+                        v_model=(f"fl_{label}_line_width", 5.0),
+                        label="Line Width",
+                        min=1.0, max=20.0, step=0.5,
+                        hide_details=True, density="compact", classes="mb-2",
+                    ):
+                        with vuetify3.Template(v_slot_append=True):
+                            vuetify3.VTextField(
+                                v_model=(f"fl_{label}_line_width", 5.0),
+                                density="compact", style="width: 65px",
+                                type="number", variant="plain", hide_details=True,
+                            )
+        
+        # Switch Column
+        with vuetify3.VCol(
+            cols="auto", 
+            classes="ps-1",
+            style="display: flex; justify-content: flex-end; min-width: 48px;"
+        ):
+            vuetify3.VSwitch(
+                v_model=(f"fl_{label}_visible", True),
+                color="primary", 
+                density="compact", 
+                hide_details=True,
+                style="height: 32px; display: inline-flex;"
+            )
+            
