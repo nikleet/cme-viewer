@@ -10,8 +10,11 @@ import datetime as dt
 import json
 import matplotlib.colors as mcolors
 import logging
+from contextlib import contextmanager
 
 # PSI imports
+from mapflpy.globals import DEFAULT_BUFFER_SIZE, Traces
+from mapflpy.tracer import TracerMP
 from mapflpy.scripts import run_fwdbwd_tracing
 from psi_io import read_hdf_by_index
 from mapflpy.utils import get_fieldline_polarity, fetch_default_launch_points
@@ -37,7 +40,7 @@ class SceneManager:
         mtime = int(self.data_dir.stat().st_mtime)
         self.run_id = f"{self.data_dir.name}_{mtime}"
 
-        print(self.data_dir)
+        logger.info(f"Data directory: {self.data_dir}")
         self.mag_files_list = utils.get_mag_files(self.data_dir)
 
         self.t0 = None
@@ -82,14 +85,16 @@ class SceneManager:
     def initialize(self):
         """Creates the initial actors and saves their meshes to the cache."""
         
-        logger.debug("Setting up initial scene...")
+        logger.info("Setting up initial scene...")
         initial_frame = self.start_frame
         mgram_actor = self._make_mgram_actor(self.mag_files_list[initial_frame])
+        logger.debug("Creating magnetogram actor...")
         if mgram_actor:
             self.actors['mgram'] = mgram_actor
             mgram_path = self.cache_dir / f'frame_{(initial_frame+1):04d}_mgram_{self.run_id}.vtp'
             self._save_actor_mesh(mgram_actor, mgram_path)
 
+        logger.debug("Creating field line actors...")
         # One actor per LP group; meshes are saved inside _make_fl_actors
         for group_label, actor in self._make_fl_actors(initial_frame).items():
             self.actors[f'fl_{group_label}'] = actor
@@ -108,7 +113,6 @@ class SceneManager:
         logger.debug(f"Preloading frames. Checking cache for {self.total_frames} frames ({self.start_frame} to {self.end_frame})...")
 
         for frame_idx in range(self.start_frame, self.end_frame + 1):
-            
             r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
 
             fl_paths = {
@@ -117,38 +121,51 @@ class SceneManager:
             }
             mgram_path = self.cache_dir / f'frame_{(frame_idx+1):04d}_mgram_{self.run_id}.vtp'
 
-            if all(p.exists() for p in fl_paths.values()) and mgram_path.exists():
+            groups_to_process = [
+                (label, r, t, p)
+                for label, r, t, p in zip(group_labels, r_groups, t_groups, p_groups)
+                if not fl_paths[label].exists()
+            ]
+            needs_mgram = not mgram_path.exists()
+
+            if not groups_to_process and not needs_mgram:
                 continue
 
-            logger.info(f"Processing frame {(frame_idx+1)}...")
+            logger.info(f"Processing frame {frame_idx + 1}...")
 
-            if not mgram_path.exists():
+            if needs_mgram:
                 values, r, t, p = read_hdf_by_index(self.mag_files_list[frame_idx][0], 0, None, None)
                 utils.create_mgram_mesh(r, t, p, values, frame='rtp').save(mgram_path)
 
-            for group_label, r_lp, t_lp, p_lp in zip(group_labels, r_groups, t_groups, p_groups):
-                fl_path = fl_paths[group_label]
-                if fl_path.exists():
-                    continue
+            if groups_to_process:
+                # Open the tracer once for all groups in this frame
+                with self._open_tracer(frame_idx) as (tracer, br_filepath):
+                    for label, r_lp, t_lp, p_lp in groups_to_process:
+                        logger.debug(f"Tracing group '{label}' for frame {frame_idx + 1}...")
+                        logger.debug(
+                            f"Group '{label}' launch points (min/max) — "
+                            f"r: [{r_lp.min():.3f}, {r_lp.max():.3f}], "
+                            f"theta: [{t_lp.min():.3f}, {t_lp.max():.3f}], "
+                            f"phi: [{p_lp.min():.3f}, {p_lp.max():.3f}]"
+                        )
+                        
+                        r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
+                            tracer, br_filepath, (r_lp, t_lp, p_lp)
+                        )
+                        temp_plotter = Plot3d(off_screen=True)
+                        try:
+                            temp_actor = temp_plotter.add_fieldlines(
+                                r_tr, t_tr, p_tr,
+                                coloring='random',
+                                dataid='line_index',
+                            )
+                            temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
+                            self._save_actor_mesh(temp_actor, fl_paths[label])
+                            logger.debug(f"Saved mesh for group '{label}'.")
+                        finally:
+                            temp_plotter.close()
 
-                r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
-                    frame_idx, (r_lp, t_lp, p_lp)
-                )
-                # Temporary off-screen plotter ensures the mesh is built with the
-                # same internal structure as the live actors
-                temp_plotter = Plot3d(off_screen=True)
-                temp_actor = temp_plotter.add_fieldlines(
-                    r_tr, t_tr, p_tr,
-                    coloring='random',
-                    dataid='line_index',
-                )
-                temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
-                self._save_actor_mesh(temp_actor, fl_path)
-                temp_plotter.close()
-
-        logging.info("Caching complete.")
-        
-        #  Reads all cached .vtp files from disk into RAM for fast playback.
+        logger.info("Caching complete.")
         logger.info("Loading meshes into RAM for playback...")
         for frame_idx in range(self.total_frames):
             self.ram_cache[frame_idx] = {}
@@ -412,7 +429,7 @@ class SceneManager:
             logger.warning(f"No tracer data found for frame {frame_idx}. Falling back to default launch points.")
             r_default, theta_default, phi_default = fetch_default_launch_points()
             return r_default, theta_default, phi_default, ['default']
-
+        logger.debug(f"Making launch points for frame {frame_idx}...")
         return self._make_lps_from_tracers(tracers, labels, return_groups=True)
     
     
@@ -429,6 +446,7 @@ class SceneManager:
         Parameters
         ----------
         frame_idx : int
+            Index of the frame to process.
 
         Returns
         -------
@@ -440,73 +458,104 @@ class SceneManager:
         coloring_kwargs = self.fl_coloring_config['kwargs']
 
         fl_actors = {}
-        for group_label, r_lp, t_lp, p_lp in zip(group_labels, r_groups, t_groups, p_groups):
-            fl_path = self.cache_dir / f'frame_{(frame_idx+1):04d}_fl_{group_label}_{self.run_id}.vtp'
 
+        # Identify which groups need tracing (no existing cache file)
+        cached, to_trace = {}, {}
+        for label, r, t, p in zip(group_labels, r_groups, t_groups, p_groups):
+            fl_path = self.cache_dir / f'frame_{(frame_idx+1):04d}_fl_{label}_{self.run_id}.vtp'
             if fl_path.exists():
-                mesh = pv.read(fl_path)
-                actor = self.plotter.add_mesh(
-                    mesh, **self._fl_plot_kwargs(coloring, **coloring_kwargs)
-                )
+                cached[label] = fl_path
             else:
-                r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
-                    frame_idx, (r_lp, t_lp, p_lp)
-                )
-                actor = self.plotter.add_fieldlines(
-                    r_tr, t_tr, p_tr,
-                    coloring='random',
-                    dataid='line_index',
-                )
-                # Embed polarity alongside random index so both coloring modes
-                # are available without re-tracing
-                actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
-                self._save_actor_mesh(actor, fl_path)
+                to_trace[label] = (r, t, p, fl_path)
 
-                # If the requested coloring isn't random, apply it now
-                if coloring != 'random':
-                    self._apply_coloring_to_actor(actor, coloring, **coloring_kwargs)
+        # Load cached groups without touching the tracer
+        for label, fl_path in cached.items():
+            mesh = pv.read(fl_path)
+            fl_actors[label] = self.plotter.add_mesh(
+                mesh, **self._fl_plot_kwargs(coloring, **coloring_kwargs)
+            )
 
-            fl_actors[group_label] = actor
+        # Trace uncached groups under a single TracerMP context
+        if to_trace:
+            with self._open_tracer(frame_idx) as (tracer, br_filepath):
+                for label, (r_lp, t_lp, p_lp, fl_path) in to_trace.items():
+                    logger.debug("Tracing field lines for group '{}', frame {}...".format(label, frame_idx))
+                    r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
+                        tracer, br_filepath, (r_lp, t_lp, p_lp)
+                    )
+                    actor = self.plotter.add_fieldlines(
+                        r_tr, t_tr, p_tr,
+                        coloring='random',
+                        dataid='line_index',
+                    )
+                    actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
+                    self._save_actor_mesh(actor, fl_path)
+                    if coloring != 'random':
+                        self._apply_coloring_to_actor(actor, coloring, **coloring_kwargs)
+                    fl_actors[label] = actor
+
         return fl_actors
     
-    
-    def _trace_fieldlines(self, frame_idx: int,
-                        lps: tuple[np.ndarray, np.ndarray, np.ndarray]
-                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Traces field lines from launch points and computes polarity.
 
-        Uses :func:`~mapflpy.scripts.run_fwdbwd_tracing` so that every
-        fieldline has endpoints on both boundaries, enabling polarity
-        classification via :func:`~mapflpy.utils.get_fieldline_polarity`.
-        Polarity is computed from the **unmasked** traces, then escapees
-        (r > 100) are set to NaN in the returned geometry arrays.
+    @contextmanager
+    def _open_tracer(self, frame_idx: int, timeout: int = 600, **kwargs):
+        """Context manager yielding a ready-to-use TracerMP for the given frame.
 
         Parameters
         ----------
         frame_idx : int
-            Selects the magnetogram files to trace through.
+        timeout : int, optional
+            Timeout in seconds for the tracing operation. Default is 600.
+        **kwargs
+            Additional arguments forwarded to ``TracerMP.__init__``.
+
+        Yields
+        ------
+        tracer : TracerMP
+        br_filepath : Path
+        """
+        mag_files = self.mag_files_list[frame_idx]
+        with TracerMP(*mag_files, timeout=timeout, **kwargs) as tracer:
+            yield tracer, mag_files[0]
+    
+    
+    def _trace_fieldlines(self,
+                      tracer: TracerMP,
+                      br_filepath: Path,
+                      lps: tuple[np.ndarray, np.ndarray, np.ndarray],
+                      buffer_size: int = DEFAULT_BUFFER_SIZE,
+                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Traces field lines from launch points and computes polarity.
+
+        Parameters
+        ----------
+        tracer : TracerMP
+            An already-initialized tracer for the current frame's magnetic field.
+            Obtain via :meth:`_open_tracer`.
+        br_filepath : Path
+            Path to the Br HDF file for the current frame, used by
+            ``get_fieldline_polarity``.
         lps : tuple[np.ndarray, np.ndarray, np.ndarray]
             Launch point coordinates ``(r, theta, phi)``.
+        buffer_size : int, optional
+            Passed to ``tracer.trace_fbwd``. Default is DEFAULT_BUFFER_SIZE.
 
         Returns
         -------
         r_tr, t_tr, p_tr : np.ndarray
-            Traced field line coordinates with escapees set to NaN.
+            Traced coordinates with escapees (r > 100) set to NaN.
         polarity : np.ndarray
-            Integer polarity label per fieldline, shape ``(N,)``.
-            See :class:`~mapflpy.globals.Polarity` for the five states.
+            Integer polarity per fieldline, shape (N,).
         """
-        mag_files = self.mag_files_list[frame_idx]
-        br_filepath = mag_files[0]
-        traces = run_fwdbwd_tracing(*mag_files, launch_points=lps, timeout=600)
+        
+        traces = tracer.trace_fbwd(lps, buffer_size)
 
         r_inner = getattr(self.cfg, 'r_inner', 1.0)
         r_outer = getattr(self.cfg, 'r_outer', 30.0)
-
         polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, traces)
-        
-        # Mask escapees after polarity is computed so they don't affect the polarity classification
-        geometry = traces.geometry  # (M, 3, N)
+
+        geometry = traces.geometry.copy()  # (M, 3, N)
+        # Mask out escaped field lines (r > 100) by setting their geometry to NaN so they won't be plotted
         mask = geometry[:, 0, :] > 100
         geometry = np.where(mask[:, None, :], np.nan, geometry)
         return geometry[:, 0, :], geometry[:, 1, :], geometry[:, 2, :], polarity
@@ -617,7 +666,7 @@ class SceneManager:
         labels_path = f'{self.data_dir}/{self.cfg.tracer_header}'
         labels = utils.read_labels(labels_path)
     
-        logger.debug(f'Successfully loaded {len(labels)} labels.')
+        logger.debug(f'Successfully loaded {len(labels)} labels for frame {frame_idx}.')
             
         return (r, theta, phi), labels
     
@@ -692,7 +741,7 @@ class SceneManager:
         theta_select = np.hstack(theta_group)
         phi_select = np.hstack(phi_group)
         label_select = np.hstack(label_group)
-
+        
         return r_select, theta_select, phi_select, label_select
     
     
