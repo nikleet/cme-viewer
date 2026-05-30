@@ -44,7 +44,7 @@ class SceneConfig:
     max_steps: int = 500
     start_frame: Optional[int] = 0
     end_frame: Optional[int] = None
-    save_cache: bool = False
+    preserve_cache: bool = False
 
 @dataclass
 class AppConfig:
