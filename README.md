@@ -223,17 +223,3 @@ scene.clear_cache(all_runs=True)
 ```
 
 
-## Project Structure
-
-```
-cme-viewer/
-├── server.py            # Application entry point
-├── scene_manager.py     # Data loading, tracing, actor management
-├── ui.py                # Trame/Vuetify3 UI definition and callbacks
-├── config.py            # Configuration dataclasses and resolution logic
-├── utils.py             # I/O helpers (HDF reading, tracer parsing, etc.)
-├── config.yaml          # (optional) Persistent configuration
-├── connect.sh           # SSH tunnel helper for remote access
-└── .cache/              # Auto-generated mesh cache (gitignored)
-```
-
