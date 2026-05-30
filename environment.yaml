@@ -28,6 +28,7 @@ dependencies:
   - pyyaml>=6.0
   - requests>=2.34
   - tomli>=2.4
+  - pip
 
   # Custom / Specialized Packages (Handled via pip)
   - pip:

@@ -59,7 +59,9 @@ class SceneManager:
         self.actors = {}
         self.ram_cache = {} # Holds {frame_idx: {actor_key: pv.PolyData}}
         
-        self.total_frames = len(self.mag_files_list)
+        self.start_frame = cfg.start_frame if cfg.start_frame is not None else 0
+        self.end_frame = cfg.end_frame if cfg.end_frame is not None else len(self.mag_files_list) - 1
+        self.total_frames = self.end_frame - self.start_frame + 1
 
         # Coloring config persists across frame updates and is applied by set_frame
         self.fl_coloring_config: dict = {
@@ -77,10 +79,11 @@ class SceneManager:
         return [key[3:] for key in self.actors if key.startswith('fl_')]
         
         
-    def initialize(self, initial_frame: int = 0):
+    def initialize(self):
         """Creates the initial actors and saves their meshes to the cache."""
         
         logger.debug("Setting up initial scene...")
+        initial_frame = self.start_frame
         mgram_actor = self._make_mgram_actor(self.mag_files_list[initial_frame])
         if mgram_actor:
             self.actors['mgram'] = mgram_actor
@@ -102,9 +105,9 @@ class SceneManager:
         ``'line_index'`` and ``'polarity'`` scalar arrays are embedded
         consistently across all frames.
         """
-        logger.debug(f"Preloading frames. Checking cache for {self.total_frames} frames...")
+        logger.debug(f"Preloading frames. Checking cache for {self.total_frames} frames ({self.start_frame} to {self.end_frame})...")
 
-        for frame_idx in range(self.total_frames):
+        for frame_idx in range(self.start_frame, self.end_frame + 1):
             
             r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
 
@@ -377,7 +380,6 @@ class SceneManager:
     def _make_mgram_actor(self, mag_files: list[str]) -> pv.Actor:
         """Creates and returns the magnetogram actor."""
         values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
-        # TODO: Move appearance settings to cfg
         return self.plotter.add_2d_slice(r, t, p, values,
                                           dataid='Magnetogram',
                                           clim=(-1e1, 1e1),

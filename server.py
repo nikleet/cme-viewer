@@ -46,6 +46,10 @@ def parse_args():
 
     # Simulation & Time Arguments
     scene_args = p.add_argument_group("Scene Metadata")
+    scene_args.add_argument("--start-frame", type=int, default=None,
+                            help="Initial frame to load.")
+    scene_args.add_argument("--end-frame", type=int, default=None,
+                            help="Last frame to load in sequence.")
     scene_args.add_argument("--time-file", default=None,
                      help="Name of file storing simulation time steps.")
     scene_args.add_argument("--t0", default=None,
@@ -68,8 +72,9 @@ def parse_args():
     fl_args.add_argument("--bg-lp", default=None,
                         help="Fixed points for background fieldlines.")
 
-    # --- Debug ---
+    # Other Arguments 
     p.add_argument("--verbose", action="store_true", help="Enable debug logs.")
+    p.add_argument("--save-cache", action="store_true", help="Preserve old cached data if new data directory is used.")
 
     return p.parse_args()
 
@@ -78,7 +83,13 @@ def main():
     args = parse_args()
     cfg = config.resolve_config(args)
 
-    log_level = logging.DEBUG if cfg.runtime_cfg.verbose else logging.INFO
+    # Setup logging
+    if cfg.runtime_cfg.verbose:
+        print("Verbose logging enabled.")
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.INFO
+        
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -87,6 +98,7 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info(f"Starting CME Viewer in {cfg.runtime_cfg.mode} mode")
     
+    # Set Pyvista to offscreen rendering and initialize Trame server
     pv.OFF_SCREEN = cfg.runtime_cfg.offscreen
     server = get_server()
     state, ctrl = server.state, server.controller
@@ -120,23 +132,24 @@ def main():
     still_ratio = cfg.runtime_cfg.still_ratio
     interactive_ratio = cfg.runtime_cfg.interactive_ratio
     
-    with SinglePageWithDrawerLayout(server) as layout:  # or SinglePageWithDrawerLayout
+    # Build Trame UI
+    with SinglePageWithDrawerLayout(server) as layout:
         layout.drawer.width = 350
         with layout.toolbar:
-            build_toolbar(state, ctrl, resources)   # no duplicate hamburger inside
+            build_toolbar(state, ctrl, resources)
         with layout.drawer:
             build_sidebar(state, resources)
         with layout.content:
             view = plotter_ui(
                 scene.plotter,
-                mode=cfg.runtime_cfg.render_mode, # Use runtime_cfg
+                mode=cfg.runtime_cfg.render_mode,
                 still_ratio=still_ratio,
                 interactive_ratio=interactive_ratio,
             )
             ctrl.view_update = view.update
             scene.set_view_update(view.update)
 
-
+    # Start the server
     logger.info(f"Starting Trame server in {cfg.runtime_cfg.mode} mode...")
     server.start(
         host=cfg.runtime_cfg.host,
