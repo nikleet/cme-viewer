@@ -3,7 +3,7 @@
 import asyncio
 from trame.widgets import vuetify3, html
 
-FRAME_TIME = 0.1
+FRAME_TIME = 0.2
 
 MGRAM_CMAPS = [
     {"title": "Seismic",   "value": "seismic"},
@@ -23,29 +23,32 @@ FL_DEFAULT_COLORS = [
 # State
 
 def init_state(state, scene):
-    state.total_frames   = scene.total_frames if scene else 1
-    state.current_frame  = 0
-    state.playing        = False
-    state.frame_label    = "Frame: 1"
-    state.time_label     = ""
-    state.drawer         = False
-    # open_panels controls which expansion panels start expanded.
-    # Values match the `value=` prop on each VExpansionPanel below.
-    state.open_panels    = ["mgram", "fl"]
-    state.mgram_visible  = True
-    state.mgram_cmap     = "seismic"
-    state.mgram_clim_min = -10.0
-    state.mgram_clim_max =  10.0
+    state.total_frames     = scene.total_frames if scene else 1
+    state.current_frame    = 0
+    state.playing          = False
+    state.frame_label      = "Frame: 1"
+    state.time_label       = ""
+    state.drawer           = False
+    state.open_panels      = ["mgram", "fl"]
+    state.mgram_visible    = True
+    state.mgram_cmap       = "seismic"
+    state.mgram_clim_min   = -10.0
+    state.mgram_clim_max   = 10.0
     state.fl_coloring_mode = "random"
     state.fl_global_line_width = 5.0
+
+    # Warmup state; only relevant in local mode
+    state.is_warming_up    = False
+    state.warmup_progress  = 0   # 0–100
+
     if scene:
         initial_time = scene.get_frame_time(0)
         if initial_time:
             state.time_label = initial_time.strftime("%Y-%m-%d %H:%M:%S")
         for i, label in enumerate(scene.fl_group_labels):
-            state[f"fl_{label}_visible"] = True
-            state[f"fl_{label}_color"]   = FL_DEFAULT_COLORS[i % len(FL_DEFAULT_COLORS)]
-            state[f"fl_{label}_opacity"] = 1.0
+            state[f"fl_{label}_visible"]    = True
+            state[f"fl_{label}_color"]      = FL_DEFAULT_COLORS[i % len(FL_DEFAULT_COLORS)]
+            state[f"fl_{label}_opacity"]    = 1.0
             state[f"fl_{label}_line_width"] = 5.0
 
 
@@ -56,20 +59,50 @@ def setup_callbacks(state, ctrl, resources):
     _loop_id     = [0]
     _is_updating = [False]
 
-    # Playback
+    # Warmup only needed once, only in local mode
+    is_local = scene and scene.mode == 'local'
+    _warmed_up = [not is_local]   # True for remote → skip warmup entirely
+
+    # Playback 
 
     @state.change("playing")
     async def on_play(playing, **kwargs):
         if not playing:
             return
+
+        # Local mode: warm up vtk.js cache on first play press 
+        # vtk.js fetches geometry arrays by content hash.  Without warming up,
+        # each frame triggers ~15 MB of WebSocket transfers that block the
+        # asyncio event loop.  We cycle through every frame once so vtk.js
+        # caches all arrays; subsequent frame changes serve from cache only.
+        if not _warmed_up[0]:
+            _warmed_up[0] = True
+            state.playing        = False   # hold playback until cache is ready
+            state.is_warming_up  = True
+            state.warmup_progress = 0
+            state.flush()
+
+            def report_progress(done, total):
+                state.warmup_progress = int(done / total * 100)
+                state.flush()
+
+            await scene._warm_up_vtk_cache(on_progress=report_progress)
+
+            state.is_warming_up   = False
+            state.warmup_progress = 100
+            state.playing         = True   # re-triggers on_play with warmed cache
+            state.flush()
+            return
+
+        # Continue with normal playback loop
         _loop_id[0] += 1
         my_id = _loop_id[0]
         while state.playing and _loop_id[0] == my_id:
             state.current_frame = (state.current_frame + 1) % state.total_frames
-            # flush() pushes the updated state to the browser AND calls any
-            # synchronous @state.change callbacks inline, so on_frame_change
-            # runs to completion (scene update + view push) before we sleep.
             state.flush()
+            await asyncio.sleep(0)   # yield before view push
+            if ctrl.view_update:
+                ctrl.view_update()
             await asyncio.sleep(FRAME_TIME)
 
     @state.change("current_frame")
@@ -81,14 +114,9 @@ def setup_callbacks(state, ctrl, resources):
             if scene:
                 scene.set_frame(current_frame)
                 state.frame_label = f"Frame: {current_frame + 1}"
-                
                 frame_time = scene.get_frame_time(current_frame)
-                if frame_time:
-                    state.time_label = frame_time.strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    state.time_label = "" 
-                
-                if ctrl.view_update:
+                state.time_label = frame_time.strftime("%Y-%m-%d %H:%M:%S") if frame_time else ""
+                if not state.playing and ctrl.view_update:
                     ctrl.view_update()
         finally:
             _is_updating[0] = False
@@ -172,15 +200,20 @@ def _register_group_callbacks(state, scene, label: str):
 # Toolbar
 
 def build_toolbar(state, ctrl, resources):
-    """
-    NOTE: No VAppBarNavIcon here. SinglePageWithDrawerLayout adds one
-    automatically; adding another creates duplicates.
-    """
     scene = resources.get("scene")
     init_state(state, scene)
     setup_callbacks(state, ctrl, resources)
 
-    with vuetify3.VBtn(icon=True, click="playing = !playing", variant="text", color="primary"):
+    # Play button: shows spinner and is disabled while the vtk.js cache warms up on the first play press.  
+    # In remote mode is_warming_up is always False so this has no effect there.
+    with vuetify3.VBtn(
+        icon=True,
+        click="playing = !playing",
+        variant="text",
+        color="primary",
+        disabled=("is_warming_up", False),
+        loading=("is_warming_up", False),   # Vuetify spinner replaces icon
+    ):
         vuetify3.VIcon("{{ playing ? 'mdi-pause' : 'mdi-play' }}")
 
     # Frame Slider
@@ -194,20 +227,22 @@ def build_toolbar(state, ctrl, resources):
         style="max-width: 400px; margin: 0 16px;",
     )
     # Frame Chip
-    vuetify3.VChip("{{ frame_label }}", 
-                   variant="outlined", 
-                   size="small", 
-                   color="secondary",
-                   classes='me-3')
-    
-    # Time/Date Chip
     vuetify3.VChip(
-        "{{ time_label }}",
-        v_show="time_label",         # Only visible when time_label string isn't empty
-        prepend_icon="mdi-calendar-clock", 
-        variant="tonal", 
+        "{{ frame_label }}", 
+        variant="outlined", 
         size="small", 
-        color="info"
+        color="secondary",
+        classes='me-3'
+    )
+    
+    # Warmup/date chip
+    vuetify3.VChip(
+        "{{ is_warming_up ? 'Caching frames… ' + warmup_progress + '%' : time_label }}",
+        v_show="time_label || is_warming_up",
+        prepend_icon=("is_warming_up ? 'mdi-cached' : 'mdi-calendar-clock'",),
+        variant="tonal",
+        size="small",
+        color=("is_warming_up ? 'warning' : 'info'",),
     )
     
     vuetify3.VSpacer()

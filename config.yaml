@@ -1,9 +1,9 @@
 runtime_cfg:
-  mode: remote
-  host: None
+  mode: local
+  host: "127.0.0.1"
   port: 8080
   open_browser: false
-  render_mode: server
+  render_mode: client
   offscreen: true
   verbose: false
   still_ratio: 1.0

@@ -11,7 +11,7 @@ CONFIG_FILE = Path("config.yaml")
 @dataclass
 class RuntimeConfig:
     """Settings related to application state and server rendering."""
-    # defaults: (default mode is local)
+    # Initialize defaults: (default mode is local)
     mode: str = "local"
     host: str = "127.0.0.1"
     port: int = 8080
@@ -20,7 +20,7 @@ class RuntimeConfig:
     offscreen: bool = False
     verbose: bool = False
     
-    # defined only for remote mode:
+    # Defined only for remote mode:
     still_ratio: Optional[float] = None
     interactive_ratio: Optional[float] = None
     aa: Optional[str] = None
@@ -29,7 +29,7 @@ class RuntimeConfig:
 @dataclass
 class SceneConfig:
     """Settings related to the CME data and simulation metadata."""
-    # Argument defaults:
+    # Initialize argument defaults:
     data_dir: Optional[Path] = None
     t0: Optional[str] = None
     time_file: str = "mas_dumps_3d.txt"
@@ -87,70 +87,101 @@ class AppConfig:
 def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path = CONFIG_FILE) -> AppConfig:
     """
     Builds the final config. 
-    Priority: CLI Args > YAML File > Defaults.
+    Priority: CLI Args > YAML File > Mode Profile > Base Defaults.
     """
     config_exists = config_path.exists()
-    # Start with defaults or load from YAML
+    
+    # Extract CLI args (ignoring unset parameters)
+    cli_dict = {k: v for k, v in vars(args).items() if v is not None} if args else {}
+
+    # Load YAML data
+    yaml_data = {}
     if config_exists:
         with open(config_path, "r") as f:
-            cfg = AppConfig.from_dict(yaml.safe_load(f) or {})
-    else:
-        cfg = AppConfig()
+            yaml_data = yaml.safe_load(f) or {}
 
-    # Override with CLI args if present
-    if args:
-        # Runtime Overrides
-        if hasattr(args, 'mode') and args.mode:
-            cfg.runtime_cfg.mode = args.mode
-            if args.mode == "local":
-                cfg.runtime_cfg.host = "127.0.0.1"
-                cfg.runtime_cfg.port = None
-                cfg.runtime_cfg.open_browser = True
-                cfg.runtime_cfg.render_mode = "client"
-                cfg.runtime_cfg.offscreen = True
-            elif args.mode == "remote":
-                cfg.runtime_cfg.host = "127.0.0.1"
-                cfg.runtime_cfg.port = 8080
-                cfg.runtime_cfg.open_browser = False
-                cfg.runtime_cfg.render_mode = "server"
-                cfg.runtime_cfg.offscreen = True
-                cfg.runtime_cfg.still_ratio = 1.0
-                cfg.runtime_cfg.interactive_ratio = 0.8
-                cfg.runtime_cfg.aa = 'ssaa'
-                cfg.runtime_cfg.multi_samples = 2
-        
-        # Extract active CLI options (ignoring unset parameters)
-        cli_dict = {k: v for k, v in vars(args).items() if v is not None}
+    # Determine the effective mode (CLI > YAML > default)
+    mode = cli_dict.get('mode') or yaml_data.get('runtime_cfg', {}).get('mode') or "local"
 
-        # Apply Runtime overrides
-        for key, value in cli_dict.items():
-            if hasattr(cfg.runtime_cfg, key):
-                setattr(cfg.runtime_cfg, key, value)
+    # Build base configuration dictionary from Dataclass defaults
+    base_cfg = {
+        "runtime_cfg": asdict(RuntimeConfig()),
+        "scene_cfg": asdict(SceneConfig())
+    }
 
-        # Apply Scene overrides
-        for key, value in cli_dict.items():
-            if hasattr(cfg.scene_cfg, key):
-                # Cast string paths to Path objects if necessary
-                if key == "data_dir" and isinstance(value, str):
-                    value = Path(value)
-                setattr(cfg.scene_cfg, key, value)
-        
-        # Normalize label_select to always be a list 
-        if isinstance(cfg.scene_cfg.label_select, str):
-            # Split by comma, strip whitespace, and filter out empty strings
-            cfg.scene_cfg.label_select = [
-                item.strip() 
-                for item in cfg.scene_cfg.label_select.split(',') 
-                if item.strip()
-            ]
-        elif cfg.scene_cfg.label_select is None:
-            cfg.scene_cfg.label_select = []
+    # Apply Mode Profile defaults (YAML and CLI will overwrite these)
+    base_cfg["runtime_cfg"]["mode"] = mode
+    if mode == "local":
+        base_cfg["runtime_cfg"].update({
+            "host": "127.0.0.1", "port": 8080, "open_browser": True,
+            "render_mode": "client", "offscreen": False
+        })
+    elif mode == "remote":
+        base_cfg["runtime_cfg"].update({
+            "host": "127.0.0.1", "port": 8080, "open_browser": False,
+            "render_mode": "server", "offscreen": True,
+            "still_ratio": 1.0, "interactive_ratio": 0.8,
+            "aa": "ssaa", "multi_samples": 2
+        })
+
+    # Apply YAML Overrides
+    if "runtime_cfg" in yaml_data:
+        for key, value in yaml_data["runtime_cfg"].items():
+            if value not in (None, "None", "null", ""):
+                base_cfg["runtime_cfg"][key] = value
+                
+    if "scene_cfg" in yaml_data:
+        for key, value in yaml_data["scene_cfg"].items():
+            if value not in (None, "None", "null", ""):
+                base_cfg["scene_cfg"][key] = value
+
+    # Apply CLI Overrides
+    for key, value in cli_dict.items():
+        if hasattr(RuntimeConfig, key):
+            base_cfg["runtime_cfg"][key] = value
+        elif hasattr(SceneConfig, key):
+            base_cfg["scene_cfg"][key] = value
+
+    # Reconstruct the object hierarchy 
+    cfg = AppConfig.from_dict(base_cfg)
     
+    # Normalize label_select
+    if isinstance(cfg.scene_cfg.label_select, str):
+        cfg.scene_cfg.label_select = [
+            item.strip() for item in cfg.scene_cfg.label_select.split(',') if item.strip()
+        ]
+    elif cfg.scene_cfg.label_select is None:
+        cfg.scene_cfg.label_select = []
+
+    # Enforce strict constraints for core mode parameters
+    if cfg.runtime_cfg.mode == "local":
+        conflicts = []
+        if cfg.runtime_cfg.render_mode != "client": 
+            conflicts.append(("render_mode", "client"))
+        if cfg.runtime_cfg.offscreen is not False: 
+            conflicts.append(("offscreen", False))
+        if cfg.runtime_cfg.open_browser is not True: 
+            conflicts.append(("open_browser", True))
+        
+        for key, expected in conflicts:
+            print(f"WARNING: '{key}' was set to '{getattr(cfg.runtime_cfg, key)}' but local mode requires it to be '{expected}'. Forcing {key}={expected}.")
+            setattr(cfg.runtime_cfg, key, expected)
+
+    elif cfg.runtime_cfg.mode == "remote":
+        conflicts = []
+        if cfg.runtime_cfg.render_mode != "server": 
+            conflicts.append(("render_mode", "server"))
+        if cfg.runtime_cfg.offscreen is not True: 
+            conflicts.append(("offscreen", True))
+        if cfg.runtime_cfg.open_browser is not False: 
+            conflicts.append(("open_browser", False))
+        
+        for key, expected in conflicts:
+            print(f"WARNING: '{key}' was set to '{getattr(cfg.runtime_cfg, key)}' but remote mode requires it to be '{expected}'. Forcing {key}={expected}.")
+            setattr(cfg.runtime_cfg, key, expected)
+
+    # Save if generating for the first time
     if args and not config_exists:
         cfg.save(config_path)
-    
+
     return cfg
-
-
-
-

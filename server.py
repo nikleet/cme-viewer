@@ -24,9 +24,9 @@ def parse_args():
     )
 
     # Core Arguments
-    p.add_argument("--mode", choices=["local", "remote"], required=True,
+    p.add_argument("--mode", choices=["local", "remote"], default=None,
                    help="Runtime mode: 'local' (browser) or 'remote' (headless).")
-    p.add_argument("--data-dir", type=Path,
+    p.add_argument("--data-dir", type=Path, 
                    help="Directory containing magnetic field and tracer .hdf files.")
 
     # Server & Rendering Arguments
@@ -73,8 +73,10 @@ def parse_args():
                         help="Fixed points for background fieldlines.")
 
     # Other Arguments 
-    p.add_argument("--verbose", action="store_true", help="Enable debug logs.")
-    p.add_argument("--preserve-cache", action="store_true", help="Preserve old cached data if new data directory is used.")
+    p.add_argument("--verbose", action="store_true", default=None, 
+                   help="Enable debug logs.")
+    p.add_argument("--preserve-cache", action="store_true", default=None, 
+                   help="Preserve old cached data if new data directory is used.")
 
     return p.parse_args()
 
@@ -99,11 +101,14 @@ def main():
     logger = logging.getLogger(__name__)
     
     # Adjust specific logging levels to reduce noise
-    logging.getLogger("trame_client").setLevel(logging.WARNING)
-    logging.getLogger("trame_server").setLevel(logging.WARNING)
+    logging.getLogger("trame_client").setLevel(logging.DEBUG)
+    logging.getLogger("trame_server").setLevel(logging.DEBUG)
     logging.getLogger("wslink").setLevel(logging.DEBUG)
     logging.getLogger("asyncio").setLevel(logging.DEBUG)
     
+    if cfg.runtime_cfg.mode not in ["local", "remote"]:
+        logger.error(f"Invalid mode '{cfg.runtime_cfg.mode}' specified. Use 'local' or 'remote'.")
+        return 1
     logger.info(f"Starting CME Viewer in {cfg.runtime_cfg.mode} mode")
     
     # Set Pyvista to offscreen rendering and initialize Trame server

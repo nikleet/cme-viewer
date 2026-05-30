@@ -1,6 +1,7 @@
 # scene_manager.py
 
 from __future__ import annotations
+import asyncio
 from typing import Optional
 from pyvisual.core.plot3d import Plot3d
 import pyvista as pv
@@ -13,9 +14,8 @@ import logging
 from contextlib import contextmanager
 
 # PSI imports
-from mapflpy.globals import DEFAULT_BUFFER_SIZE, Traces
+from mapflpy.globals import DEFAULT_BUFFER_SIZE
 from mapflpy.tracer import TracerMP
-from mapflpy.scripts import run_fwdbwd_tracing
 from psi_io import read_hdf_by_index
 from mapflpy.utils import get_fieldline_polarity, fetch_default_launch_points
 
@@ -88,13 +88,13 @@ class SceneManager:
         logger.info("Setting up initial scene...")
         initial_frame = self.start_frame
         mgram_actor = self._make_mgram_actor(self.mag_files_list[initial_frame])
-        logger.debug("Creating magnetogram actor...")
+        logger.info("Creating magnetogram actor...")
         if mgram_actor:
             self.actors['mgram'] = mgram_actor
             mgram_path = self.cache_dir / f'frame_{(initial_frame+1):04d}_mgram_{self.run_id}.vtp'
             self._save_actor_mesh(mgram_actor, mgram_path)
 
-        logger.debug("Creating field line actors...")
+        logger.info("Creating field line actors...")
         # One actor per LP group; meshes are saved inside _make_fl_actors
         for group_label, actor in self._make_fl_actors(initial_frame).items():
             self.actors[f'fl_{group_label}'] = actor
@@ -110,7 +110,7 @@ class SceneManager:
         ``'line_index'`` and ``'polarity'`` scalar arrays are embedded
         consistently across all frames.
         """
-        logger.debug(f"Preloading frames. Checking cache for {self.total_frames} frames ({self.start_frame} to {self.end_frame})...")
+        logger.info(f"Preloading frames. Checking cache for {self.total_frames} frames ({self.start_frame} to {self.end_frame})...")
 
         for frame_idx in range(self.start_frame, self.end_frame + 1):
             r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
@@ -141,7 +141,7 @@ class SceneManager:
                 # Open the tracer once for all groups in this frame
                 with self._open_tracer(frame_idx) as (tracer, br_filepath):
                     for label, r_lp, t_lp, p_lp in groups_to_process:
-                        logger.debug(f"Tracing group '{label}' for frame {frame_idx + 1}...")
+                        logger.info(f"Tracing group '{label}' for frame {frame_idx + 1}...")
                         logger.debug(
                             f"Group '{label}' launch points (min/max) — "
                             f"r: [{r_lp.min():.3f}, {r_lp.max():.3f}], "
@@ -161,7 +161,7 @@ class SceneManager:
                             )
                             temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
                             self._save_actor_mesh(temp_actor, fl_paths[label])
-                            logger.debug(f"Saved mesh for group '{label}'.")
+                            logger.info(f"Saved mesh for group '{label}'.")
                         finally:
                             temp_plotter.close()
 
@@ -190,39 +190,18 @@ class SceneManager:
     
     
     def set_frame(self, frame_idx: int):
-        """Updates all registered actors by loading their meshes from cache.
-
-        After updating geometry via ``copy_from``, coloring is explicitly
-        re-applied from :attr:`fl_coloring_config` to ensure it persists
-        regardless of any mapper state reset.
-        """
+        """Updates all registered actors by loading their meshes from the RAM cache."""
         if not (0 <= frame_idx < self.total_frames):
             return
 
         for key, actor in self.actors.items():
-            path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
-            if path.exists():
-                # Fetch the pre-loaded mesh from RAM
-                new_mesh = self.ram_cache.get(frame_idx, {}).get(key)
-                
-                # # Old code read from cache every time
-                # new_mesh = pv.read(path)
+            new_mesh = self.ram_cache.get(frame_idx, {}).get(key)
+            if new_mesh is not None:
                 actor.mapper.dataset.copy_from(new_mesh)
                 actor.mapper.dataset.Modified()
                 actor.mapper.Modified()
             else:
-                logger.warning(f"Warning: cache missing for frame {frame_idx}, component '{key}'")
-        
-        # Re-apply coloring to FL actors after geometry update.
-        per_group = self.fl_coloring_config.get('per_group', {})
-        for key, actor in self.actors.items():
-            if key.startswith('fl_'):
-                group_label = key[3:]
-                if group_label in per_group:
-                    cfg = per_group[group_label]
-                else:
-                    cfg = self.fl_coloring_config
-                self._apply_coloring_to_actor(actor, cfg['coloring'], **cfg['kwargs'])
+                logger.warning(f"Cache missing for frame {frame_idx}, component '{key}'")
 
     
     def set_actor_property(self, actor_key: str, **props):
@@ -339,7 +318,7 @@ class SceneManager:
     def clear_cache(self, all_runs: bool = False):
         """Deletes cached files."""
         if all_runs:
-            logger.debug("Clearing entire cache...")
+            logger.info("Clearing entire cache...")
             for f in self.cache_dir.glob("*.vtp"):
                 f.unlink()
             for f in self.cache_dir.glob("*.dat"):
@@ -348,7 +327,7 @@ class SceneManager:
             if manifest_path.exists():
                 manifest_path.unlink()
         else:
-            logger.debug(f"Clearing cache for run {self.run_id}...")
+            logger.info(f"Clearing cache for run {self.run_id}...")
             for f in self.cache_dir.glob(f"*{self.run_id}*"):
                 f.unlink()
     
@@ -380,7 +359,7 @@ class SceneManager:
                 cached_manifest = json.load(f)
             if cached_manifest == manifest:
                 return  # Cache is valid, nothing to do
-            logger.debug("Cache manifest mismatch. Clearing stale cache...")
+            logger.info("Cache manifest mismatch. Clearing stale cache...")
             self.clear_cache(all_runs=True)
 
         with open(manifest_path, 'w') as f:
@@ -429,7 +408,7 @@ class SceneManager:
             logger.warning(f"No tracer data found for frame {frame_idx}. Falling back to default launch points.")
             r_default, theta_default, phi_default = fetch_default_launch_points()
             return r_default, theta_default, phi_default, ['default']
-        logger.debug(f"Making launch points for frame {frame_idx}...")
+        logger.info(f"Making launch points for frame {frame_idx}...")
         return self._make_lps_from_tracers(tracers, labels, return_groups=True)
     
     
@@ -479,7 +458,7 @@ class SceneManager:
         if to_trace:
             with self._open_tracer(frame_idx) as (tracer, br_filepath):
                 for label, (r_lp, t_lp, p_lp, fl_path) in to_trace.items():
-                    logger.debug("Tracing field lines for group '{}', frame {}...".format(label, frame_idx))
+                    logger.info("Tracing field lines for group '{}', frame {}...".format(label, frame_idx))
                     r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
                         tracer, br_filepath, (r_lp, t_lp, p_lp)
                     )
@@ -666,7 +645,7 @@ class SceneManager:
         labels_path = f'{self.data_dir}/{self.cfg.tracer_header}'
         labels = utils.read_labels(labels_path)
     
-        logger.debug(f'Successfully loaded {len(labels)} labels for frame {frame_idx}.')
+        logger.info(f'Successfully loaded {len(labels)} labels for frame {frame_idx}.')
             
         return (r, theta, phi), labels
     
@@ -708,7 +687,7 @@ class SceneManager:
             theta_tr = np.hstack((theta_tr, theta_bg))
             phi_tr = np.hstack((phi_tr, phi_bg))
             labels.extend(len(phi_bg) * ['background'])
-            logger.debug('After adding background, number of labels:{}'.format(len(labels)))
+            logger.info('After adding background, number of labels:{}'.format(len(labels)))
 
         # Get unique labels and mappings back to original indices
         labels, label_ids, label_orig = np.unique(
@@ -761,3 +740,38 @@ class SceneManager:
         label_fpath = self.cache_dir / 'tracer_header_select.dat'
         if not label_fpath.exists():
             utils.write_labels(label_fpath, group_labels)
+            
+            
+    async def _warm_up_vtk_cache(self, on_progress=None):
+        """Pre-push all frame geometries to the vtk.js client-side array cache."""
+        if self._view_update_fn is None:
+            logger.warning("Warmup called before view_update_fn was registered.")
+            return
+
+        logger.info(f"Local mode: pre-loading {self.total_frames} frames into vtk.js cache...")
+
+        for frame_idx in range(self.total_frames):
+            frame_cache = self.ram_cache.get(frame_idx, {})
+            for key, actor in self.actors.items():
+                new_mesh = frame_cache.get(key)
+                if new_mesh is not None:
+                    actor.mapper.dataset.copy_from(new_mesh)
+                    actor.mapper.dataset.Modified()
+                    actor.mapper.Modified()
+
+            # Tell vtk.js the geometry changed → it issues array.get requests
+            self._view_update_fn()
+
+            if on_progress:
+                on_progress(frame_idx + 1, self.total_frames)
+
+            # Yield repeatedly so the event loop can fully drain the array.get
+            # requests before we push the next frame.  On localhost, 15 MB
+            # transfers in < 50 ms; ten 50 ms steps gives a 10× safety margin.
+            for _ in range(10):
+                await asyncio.sleep(0.1)
+
+        # Restore initial frame
+        self.set_frame(0)
+        self._view_update_fn()
+        logger.info("vtk.js cache warmup complete — playback ready.")
