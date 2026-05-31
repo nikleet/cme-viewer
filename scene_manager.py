@@ -142,7 +142,7 @@ class SceneManager:
                 with self._open_tracer(frame_idx) as (tracer, br_filepath):
                     for label, r_lp, t_lp, p_lp in groups_to_process:
                         logger.info(f"Tracing group '{label}' for frame {frame_idx + 1}...")
-                        logger.debug(
+                        logger.info(
                             f"Group '{label}' launch points (min/max) — "
                             f"r: [{r_lp.min():.3f}, {r_lp.max():.3f}], "
                             f"theta: [{t_lp.min():.3f}, {t_lp.max():.3f}], "

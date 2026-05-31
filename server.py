@@ -88,23 +88,25 @@ def main():
     # Setup logging
     if cfg.runtime_cfg.verbose:
         print("Verbose logging enabled.")
-        log_level = logging.DEBUG
+        main_log_level = logging.DEBUG
+        noisy_log_level = logging.DEBUG
     else:
-        log_level = logging.INFO
+        main_log_level = logging.INFO
+        noisy_log_level = logging.WARNING  # Mutes spam from Trame 
         
     logging.basicConfig(
-        level=log_level,
+        level=main_log_level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%H:%M:%S'
     )
     
     logger = logging.getLogger(__name__)
     
-    # Adjust specific logging levels to reduce noise
-    logging.getLogger("trame_client").setLevel(logging.DEBUG)
-    logging.getLogger("trame_server").setLevel(logging.DEBUG)
-    logging.getLogger("wslink").setLevel(logging.DEBUG)
-    logging.getLogger("asyncio").setLevel(logging.DEBUG)
+    # Restrict the chatty modules to the noisy_log_level
+    logging.getLogger("trame_client").setLevel(noisy_log_level)
+    logging.getLogger("trame_server").setLevel(noisy_log_level)
+    logging.getLogger("wslink").setLevel(noisy_log_level)
+    logging.getLogger("asyncio").setLevel(noisy_log_level)
     
     if cfg.runtime_cfg.mode not in ["local", "remote"]:
         logger.error(f"Invalid mode '{cfg.runtime_cfg.mode}' specified. Use 'local' or 'remote'.")
