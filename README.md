@@ -28,9 +28,6 @@ The viewer streams a live 3D scene to a web browser, allowing navigation through
 - `psi_io`
 - `numpy`, `matplotlib`, `pyyaml`
 
-> PSI libraries (`mapflpy`, `psi_io`) are proprietary.
-
-
 ## Installation
 
 ```bash
