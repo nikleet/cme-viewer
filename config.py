@@ -26,11 +26,38 @@ class RuntimeConfig:
     aa: Optional[str] = None
     multi_samples: Optional[int] = None
 
+    def __post_init__(self):
+        """Enforce strict synchronization between application mode and rendering parameters."""
+        if self.mode == "remote":
+            if self.render_mode != "server":
+                print(f"WARNING: 'render_mode' was set to '{self.render_mode}' but remote mode requires 'server'. Forcing render_mode=server.")
+                self.render_mode = "server"
+            if not self.offscreen:
+                print(f"WARNING: 'offscreen' was set to '{self.offscreen}' but remote mode requires True. Forcing offscreen=True.")
+                self.offscreen = True
+            if self.open_browser:
+                print(f"WARNING: 'open_browser' was set to '{self.open_browser}' but remote mode requires False. Forcing open_browser=False.")
+                self.open_browser = False
+        elif self.mode == "local":
+            if self.render_mode != "client":
+                print(f"WARNING: 'render_mode' was set to '{self.render_mode}' but local mode requires 'client'. Forcing render_mode=client.")
+                self.render_mode = "client"
+            if self.offscreen:
+                print(f"WARNING: 'offscreen' was set to '{self.offscreen}' but local mode requires False. Forcing offscreen=False.")
+                self.offscreen = False
+            if not self.open_browser:
+                print(f"WARNING: 'open_browser' was set to '{self.open_browser}' but local mode requires True. Forcing open_browser=True.")
+                self.open_browser = True
+
+
 @dataclass
 class SceneConfig:
     """Settings related to the CME data and simulation metadata."""
     # Initialize argument defaults:
-    data_dir: Optional[Path] = None
+    cor_dir: Optional[Path] = None
+    hel_dir: Optional[Path] = None          
+    r_interface: float = 30.0               
+    helio_shift: float = 0.0                
     t0: Optional[str] = None
     time_file: str = "mas_dumps_3d.txt"
     tracer_header: str = "tracer_header.dat"
@@ -45,6 +72,7 @@ class SceneConfig:
     start_frame: Optional[int] = 0
     end_frame: Optional[int] = None
     preserve_cache: bool = False
+
 
 @dataclass
 class AppConfig:
@@ -71,8 +99,10 @@ class AppConfig:
         scene_data = data.get("scene_cfg", {})
         
         # Handle Path casting
-        if scene_data.get("data_dir"):
-            scene_data["data_dir"] = Path(scene_data["data_dir"])
+        if scene_data.get("cor_dir"):
+            scene_data["cor_dir"] = Path(scene_data["cor_dir"])
+        if scene_data.get("hel_dir"):                       
+            scene_data["hel_dir"] = Path(scene_data["hel_dir"]) 
 
         return cls(
             runtime_cfg=RuntimeConfig(**runtime_data),
@@ -142,7 +172,7 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
         elif hasattr(SceneConfig, key):
             base_cfg["scene_cfg"][key] = value
 
-    # Reconstruct the object hierarchy 
+    # Reconstruct the object hierarchy (triggers __post_init__ validation)
     cfg = AppConfig.from_dict(base_cfg)
     
     # Normalize label_select
@@ -152,33 +182,6 @@ def resolve_config(args: Optional[argparse.Namespace] = None, config_path: Path 
         ]
     elif cfg.scene_cfg.label_select is None:
         cfg.scene_cfg.label_select = []
-
-    # Enforce strict constraints for core mode parameters
-    if cfg.runtime_cfg.mode == "local":
-        conflicts = []
-        if cfg.runtime_cfg.render_mode != "client": 
-            conflicts.append(("render_mode", "client"))
-        if cfg.runtime_cfg.offscreen is not False: 
-            conflicts.append(("offscreen", False))
-        if cfg.runtime_cfg.open_browser is not True: 
-            conflicts.append(("open_browser", True))
-        
-        for key, expected in conflicts:
-            print(f"WARNING: '{key}' was set to '{getattr(cfg.runtime_cfg, key)}' but local mode requires it to be '{expected}'. Forcing {key}={expected}.")
-            setattr(cfg.runtime_cfg, key, expected)
-
-    elif cfg.runtime_cfg.mode == "remote":
-        conflicts = []
-        if cfg.runtime_cfg.render_mode != "server": 
-            conflicts.append(("render_mode", "server"))
-        if cfg.runtime_cfg.offscreen is not True: 
-            conflicts.append(("offscreen", True))
-        if cfg.runtime_cfg.open_browser is not False: 
-            conflicts.append(("open_browser", False))
-        
-        for key, expected in conflicts:
-            print(f"WARNING: '{key}' was set to '{getattr(cfg.runtime_cfg, key)}' but remote mode requires it to be '{expected}'. Forcing {key}={expected}.")
-            setattr(cfg.runtime_cfg, key, expected)
 
     # Save if generating for the first time
     if args and not config_exists:

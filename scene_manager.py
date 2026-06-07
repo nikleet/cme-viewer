@@ -13,11 +13,15 @@ import matplotlib.colors as mcolors
 import logging
 from contextlib import contextmanager
 
-# PSI imports
+
+# Solar imports
+import astropy.units as u
+import sunpy.sun.constants as sun_constants
 from mapflpy.globals import DEFAULT_BUFFER_SIZE
 from mapflpy.tracer import TracerMP
+from mapflpy.utils import get_fieldline_polarity, fetch_default_launch_points, combine_and_pad_fieldlines
+from mapflpy.scripts import _inter_domain_tracing
 from psi_io import read_hdf_by_index
-from mapflpy.utils import get_fieldline_polarity, fetch_default_launch_points
 
 # Local imports
 from config import SceneConfig
@@ -33,26 +37,64 @@ logger = logging.getLogger(__name__)
 
 class SceneManager:
     def __init__(self, cfg: SceneConfig, cache_dir: str = ".cache", mode: str = "local", **kwargs):
-        self.cfg: SceneConfig = cfg
         self.mode = mode    # 'local' or 'remote'
-        self.data_dir: Path = cfg.data_dir
+        self.cfg = cfg
+        # Coronal & Heliospheric Directories
+        self.cor_dir = Path(getattr(cfg, 'cor_dir', cfg.cor_dir))
+        self.hel_dir = Path(cfg.hel_dir) if getattr(cfg, 'hel_dir', None) else None
         
-        mtime = int(self.data_dir.stat().st_mtime)
-        self.run_id = f"{self.data_dir.name}_{mtime}"
+        mtime = int(self.cor_dir.stat().st_mtime)
+        self.run_id = f"{self.cor_dir.name}_{mtime}"
 
-        logger.info(f"Data directory: {self.data_dir}")
-        self.mag_files_list = utils.get_mag_files(self.data_dir)
+        logger.info(f"Coronal data directory: {self.cor_dir}")
+        if self.hel_dir:
+            logger.info(f"Heliospheric data directory: {self.hel_dir}")
+
+        self.cor_mag_files_list = utils.get_mag_files(self.cor_dir)
+        self.hel_mag_files_list = utils.get_mag_files(self.hel_dir) if self.hel_dir else []
+        self.mag_files_list = self.cor_mag_files_list
 
         self.t0 = None
         if cfg.t0:
             dt_obj = dt.datetime.strptime(cfg.t0, '%m/%d/%Y %H:%M:%S')
             self.t0 = utils.round_seconds(dt_obj)
 
+        # Parse Multi-Domain Time Files & Compute Time Shift Array
         self.ut_datetimes = None
-        time_path = self.data_dir / cfg.time_file
-        if time_path.exists():
-            raw_times = utils.get_hdf_times(time_path)
-            self.ut_datetimes = utils.mastime_to_ut(raw_times, t0=self.t0)
+        self.cor_times = np.array([])
+        self.hel_times = np.array([])
+        
+        # Initialize shift array with the static fallback configuration value
+        static_shift = getattr(cfg, 'helio_shift', 0.0)
+        self.helio_shifts = np.full(len(self.mag_files_list), static_shift if static_shift is not None else 0.0)
+
+        cor_time_path = self.cor_dir / cfg.time_file
+        if cor_time_path.exists():
+            cor_time_dict = utils.get_hdf_times(cor_time_path)
+            self.cor_times = np.array(list(cor_time_dict.values()), dtype=float)
+            self.ut_datetimes = utils.mastime_to_ut(cor_time_dict, t0=self.t0)
+
+        if self.hel_dir and self.hel_dir.exists():
+            hel_time_path = self.hel_dir / cfg.time_file
+            if hel_time_path.exists():
+                try:
+                    self.hel_times = np.array(list(utils.get_hdf_times(hel_time_path).values()), dtype=float)
+                    min_len = min(len(self.cor_times), len(self.hel_times))
+                    if min_len > 0:
+                        # Time delta in hours
+                        delta_t = self.hel_times[:min_len] - self.cor_times[:min_len]
+                        # Track sidereal velocity using SunPy constants converted to rad/hour
+                        omega_sun = sun_constants.sidereal_rotation_rate.to(u.rad / u.h).value
+                        computed_shifts = delta_t * omega_sun
+                        self.helio_shifts[:min_len] = computed_shifts
+                        logger.info(f"Successfully computed dynamic helio_shifts from time files. Sample shift (Frame 0): {computed_shifts[0]:.4f} rad")
+                except Exception as e:
+                    logger.warning(f"Could not compute dynamic helio_shift from time file: {e}. Falling back to static values.")
+            else:
+                logger.info(
+                    f"No heliospheric time file found at {hel_time_path}. "
+                    f"Using static configuration shift: {cfg.helio_shift}"
+                )
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -101,16 +143,11 @@ class SceneManager:
     
 
     def preload_all_frames(self):
-        """Precomputes and caches per-group fieldline and magnetogram meshes, then loads them into RAM in remote mode
-        or creates all actors in local mode.
-
-        Skips any frame/group combination that is already cached.  A temporary
-        off-screen plotter is used to build each fieldline mesh via
-        :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines` so that both
-        ``'line_index'`` and ``'polarity'`` scalar arrays are embedded
-        consistently across all frames.
-        """
+        """Precomputes and caches per-group fieldline and magnetogram meshes, then loads them into RAM."""
         logger.info(f"Preloading frames. Checking cache for {self.total_frames} frames ({self.start_frame} to {self.end_frame})...")
+        from contextlib import ExitStack
+
+        is_dual_domain = hasattr(self, 'cor_files') and hasattr(self, 'hel_files')
 
         for frame_idx in range(self.start_frame, self.end_frame + 1):
             r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
@@ -134,17 +171,24 @@ class SceneManager:
             logger.info(f"Processing frame {frame_idx + 1}...")
 
             if needs_mgram:
-                values, r, t, p = read_hdf_by_index(self.mag_files_list[frame_idx][0], 0, None, None)
+                mag_files = self.cor_files[frame_idx] if is_dual_domain else self.mag_files_list[frame_idx]
+                values, r, t, p = read_hdf_by_index(mag_files[0], 0, None, None)
                 utils.create_mgram_mesh(r, t, p, values, frame='rtp').save(mgram_path)
 
             if groups_to_process:
-                # Open the tracer once for all groups in this frame
-                with self._open_tracer(frame_idx) as (tracer, br_filepath):
+                with ExitStack() as stack:
+                    if is_dual_domain:
+                        tracer, br_filepath = stack.enter_context(self._open_tracer(frame_idx, domain='cor'))
+                        hel_tracer, _       = stack.enter_context(self._open_tracer(frame_idx, domain='hel'))
+                    else:
+                        tracer, br_filepath = stack.enter_context(self._open_tracer(frame_idx))
+                        hel_tracer = None
+
                     for label, r_lp, t_lp, p_lp in groups_to_process:
                         logger.info(f"Tracing group '{label}' for frame {frame_idx + 1}...")
                         
                         r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
-                            tracer, br_filepath, (r_lp, t_lp, p_lp)
+                            tracer, br_filepath, (r_lp, t_lp, p_lp), hel_tracer=hel_tracer
                         )
                         temp_plotter = Plot3d(off_screen=True)
                         try:
@@ -155,9 +199,6 @@ class SceneManager:
                             )
                             temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
                             self._save_actor_mesh(temp_actor, fl_paths[label])
-                                                        # Diagnostic — remove once resolved
-                            _check = pv.read(fl_paths[label])
-                            _pts = _check.points
                             logger.info(f"Saved mesh for group '{label}'.")
                         finally:
                             temp_plotter.close()
@@ -196,10 +237,10 @@ class SceneManager:
                 logger.warning(f"Cache missing for frame {frame_idx}, component '{key}'")
                 continue
             
-            # Instead of using mapper.dataset.copy_from(new_mesh), bypass the filter entirely by replacing the mapper's
-            # input connection with a direct SetInputData to the new mesh. This way we are sure the mapper is using our 
-            # updated geometry directly,and not re-running some upstream filter that may have cached data from a 
-            # previous frame.
+            # mapper.dataset.copy_from(new_mesh) was being overwritten by an upstream VTK filter in remote mode, which
+            # broke the link to the actor and prevented updates from propagating to the view.  
+            # We switch to SetInputData which seems to preserve the mapper connection and allows the new geometry to 
+            # update properly.
             actor.GetMapper().SetInputData(new_mesh)
             actor.GetMapper().Modified()
 
@@ -360,7 +401,12 @@ class SceneManager:
     def _check_manifest(self):
         """Checks the cache manifest against the current run. Clears the cache if stale."""
         manifest_path = self.cache_dir / 'manifest.json'
-        manifest = {'data_dir': str(self.data_dir), 'run_id': self.run_id}
+        
+        manifest = {
+            'cor_dir': str(self.cor_dir),
+            'hel_dir': str(self.hel_dir) if self.hel_dir else None,
+            'run_id': self.run_id
+        }
 
         if manifest_path.exists():
             with open(manifest_path, 'r') as f:
@@ -421,30 +467,14 @@ class SceneManager:
     
     
     def _make_fl_actors(self, frame_idx: int) -> dict[str, pv.Actor]:
-        """Creates one fieldline actor per launch point group.
-
-        For each group returned by :meth:`_get_lps_for_frame`, field lines are
-        traced and an actor is created via
-        :meth:`~pyvisual.core.plot3d.Plot3d.add_fieldlines`.  Both
-        ``'line_index'`` (random coloring) and ``'polarity'`` scalar arrays are
-        embedded in the mesh before saving to the VTP cache, so that
-        :meth:`apply_fl_coloring` can switch between modes without re-tracing.
-
-        Parameters
-        ----------
-        frame_idx : int
-            Index of the frame to process.
-
-        Returns
-        -------
-        dict[str, pv.Actor]
-            Mapping of group label → fieldline actor.
-        """
+        """Creates one fieldline actor per launch point group."""
         r_groups, t_groups, p_groups, group_labels = self._get_lps_for_frame(frame_idx)
         coloring = self.fl_coloring_config['coloring']
         coloring_kwargs = self.fl_coloring_config['kwargs']
 
         fl_actors = {}
+        is_dual_domain = hasattr(self, 'cor_files') and hasattr(self, 'hel_files')
+        from contextlib import ExitStack
 
         # Identify which groups need tracing (no existing cache file)
         cached, to_trace = {}, {}
@@ -462,13 +492,20 @@ class SceneManager:
                 mesh, **self._fl_plot_kwargs(coloring, **coloring_kwargs)
             )
 
-        # Trace uncached groups under a single TracerMP context
+        # Trace uncached groups under unified tracer context(s)
         if to_trace:
-            with self._open_tracer(frame_idx) as (tracer, br_filepath):
+            with ExitStack() as stack:
+                if is_dual_domain:
+                    tracer, br_filepath = stack.enter_context(self._open_tracer(frame_idx, domain='cor'))
+                    hel_tracer, _       = stack.enter_context(self._open_tracer(frame_idx, domain='hel'))
+                else:
+                    tracer, br_filepath = stack.enter_context(self._open_tracer(frame_idx))
+                    hel_tracer = None
+
                 for label, (r_lp, t_lp, p_lp, fl_path) in to_trace.items():
                     logger.info("Tracing field lines for group '{}', frame {}...".format(label, frame_idx))
                     r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
-                        tracer, br_filepath, (r_lp, t_lp, p_lp)
+                        tracer, br_filepath, (r_lp, t_lp, p_lp), hel_tracer=hel_tracer
                     )
                     actor = self.plotter.add_fieldlines(
                         r_tr, t_tr, p_tr,
@@ -477,35 +514,27 @@ class SceneManager:
                     )
                     actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
                     self._save_actor_mesh(actor, fl_path)
+                    
                     if coloring != 'random':
                         self._apply_coloring_to_actor(actor, coloring, **coloring_kwargs)
                     fl_actors[label] = actor
-                    logger.info(
-                        f"Actor '{label}' mapper input type: "
-                        f"{type(actor.GetMapper().GetInputAlgorithm())} | "
-                        f"HasInputConnection: {actor.GetMapper().GetInputConnection(0,0) is not None}"
-                    )
+                    
         return fl_actors
     
 
     @contextmanager
-    def _open_tracer(self, frame_idx: int, timeout: int = 600, **kwargs):
+    def _open_tracer(self, frame_idx: int, domain: Optional[str] = None, timeout: int = 600, **kwargs):
         """Context manager yielding a ready-to-use TracerMP for the given frame.
-
-        Parameters
-        ----------
-        frame_idx : int
-        timeout : int, optional
-            Timeout in seconds for the tracing operation. Default is 600.
-        **kwargs
-            Additional arguments forwarded to ``TracerMP.__init__``.
-
-        Yields
-        ------
-        tracer : TracerMP
-        br_filepath : Path
+        
+        Supports optional domain selection ('cor' or 'hel') for dual-domain setups.
         """
-        mag_files = self.mag_files_list[frame_idx]
+        if domain == 'cor':
+            mag_files = self.cor_files[frame_idx]
+        elif domain == 'hel':
+            mag_files = self.hel_files[frame_idx]
+        else:
+            mag_files = self.mag_files_list[frame_idx]
+
         with TracerMP(*mag_files, timeout=timeout, context='fork', **kwargs) as tracer:
             yield tracer, mag_files[0]
     
@@ -514,41 +543,38 @@ class SceneManager:
                       tracer: TracerMP,
                       br_filepath: Path,
                       lps: tuple[np.ndarray, np.ndarray, np.ndarray],
+                      hel_tracer: Optional[TracerMP] = None,
                       buffer_size: int = DEFAULT_BUFFER_SIZE,
                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Traces field lines from launch points and computes polarity.
-
-        Parameters
-        ----------
-        tracer : TracerMP
-            An already-initialized tracer for the current frame's magnetic field.
-            Obtain via :meth:`_open_tracer`.
-        br_filepath : Path
-            Path to the Br HDF file for the current frame, used by
-            ``get_fieldline_polarity``.
-        lps : tuple[np.ndarray, np.ndarray, np.ndarray]
-            Launch point coordinates ``(r, theta, phi)``.
-        buffer_size : int, optional
-            Passed to ``tracer.trace_fbwd``. Default is DEFAULT_BUFFER_SIZE.
-
-        Returns
-        -------
-        r_tr, t_tr, p_tr : np.ndarray
-            Traced coordinates with escapees (r > 100) set to NaN.
-        polarity : np.ndarray
-            Integer polarity per fieldline, shape (N,).
+        Automatically handles both single-domain and coupled dual-domain tracers.
         """
-        
-        traces = tracer.trace_fbwd(lps, buffer_size)
-
         r_inner = getattr(self.cfg, 'r_inner', 1.0)
         r_outer = getattr(self.cfg, 'r_outer', 30.0)
-        polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, traces)
 
-        geometry = traces.geometry.copy()  # (M, 3, N)
-        # Mask out escaped field lines (r > 100) by setting their geometry to NaN so they won't be plotted
+        if hel_tracer is not None:
+            # Dual-domain / Inter-domain tracing
+            inter_domain_traces, *_ = _inter_domain_tracing(
+                tracer, hel_tracer, launch_points=lps
+            )
+            # Stitch domain segments together into a single uniform grid representation
+            padded_traces = combine_and_pad_fieldlines(inter_domain_traces)
+            
+            # Safely handle if combine_and_pad_fieldlines returns a Traces object or raw array
+            geometry = padded_traces.geometry if hasattr(padded_traces, 'geometry') else padded_traces
+            
+            # Compute multi-domain fieldline boundary polarities
+            polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, inter_domain_traces)
+        else:
+            # Single-domain tracing fallback
+            traces = tracer.trace_fbwd(lps, buffer_size)
+            polarity = get_fieldline_polarity(r_inner, r_outer, br_filepath, traces)
+            geometry = traces.geometry.copy()
+
+        # Mask out escaped field lines (r > 100) by setting geometry coordinates to NaN
         mask = geometry[:, 0, :] > 100
         geometry = np.where(mask[:, None, :], np.nan, geometry)
+        
         return geometry[:, 0, :], geometry[:, 1, :], geometry[:, 2, :], polarity
     
 
@@ -644,7 +670,7 @@ class SceneManager:
             
             
     def _get_tracers(self, frame_idx: int):
-        hdf_filename = f'{self.data_dir}/{self.cfg.tracer_prefix}{(frame_idx+1):06d}.hdf'
+        hdf_filename = f'{self.cor_dir}/{self.cfg.tracer_prefix}{(frame_idx+1):06d}.hdf'
         
         # try to read tracer data
         try:
@@ -654,7 +680,7 @@ class SceneManager:
             logger.error(f'Could not find tracers in {hdf_filename}: {e}')
             return (None, None, None), None
 
-        labels_path = f'{self.data_dir}/{self.cfg.tracer_header}'
+        labels_path = f'{self.cor_dir}/{self.cfg.tracer_header}'
         labels = utils.read_labels(labels_path)
     
         logger.info(f'Successfully loaded {len(labels)} labels for frame {frame_idx}.')

@@ -26,8 +26,16 @@ def parse_args():
     # Core Arguments
     p.add_argument("--mode", choices=["local", "remote"], default=None,
                    help="Runtime mode: 'local' (browser) or 'remote' (headless).")
-    p.add_argument("--data-dir", type=Path, 
-                   help="Directory containing magnetic field and tracer .hdf files.")
+    p.add_argument("--cor-dir", type=Path, default=None,
+                   help="Directory containing coronal magnetic field and tracer .hdf files.")
+    
+    # Multi-Domain Arguments
+    p.add_argument("--hel-dir", type=Path, default=None,
+                   help="Directory containing heliospheric magnetic field and tracer .hdf files (optional).")
+    p.add_argument("--r-interface", type=float, default=None,
+                   help="Radial boundary interface (in Solar Radii) connecting coronal and heliospheric domains.")
+    p.add_argument("--helio-shift", type=float, default=None,
+                   help="Longitudinal shift angle (in RADIANS) between heliospheric and coronal domains.")
 
     # Server & Rendering Arguments
     server_args = p.add_argument_group("Server & Render Settings")
@@ -119,12 +127,15 @@ def main():
     state, ctrl = server.state, server.controller
     
     # Initialize Scene Manager
-    if cfg.scene_cfg.data_dir and cfg.scene_cfg.data_dir.exists():
+    if cfg.scene_cfg.cor_dir and cfg.scene_cfg.cor_dir.exists():
+        if cfg.scene_cfg.hel_dir and not cfg.scene_cfg.hel_dir.exists():
+            logger.critical(f"Heliospheric directory specified but not found: {cfg.scene_cfg.hel_dir}")
+            return 1
         scene = SceneManager(cfg.scene_cfg, line_smoothing=True, mode=cfg.runtime_cfg.mode)
         logger.info("Initializing scene manager...")
     else:
-        logger.critical(f"Data directory not found: {cfg.scene_cfg.data_dir}")
-        logger.info("Please check the 'data_dir' path in your config.yaml or CLI arguments.")
+        logger.critical(f"Coronal directory not found: {cfg.scene_cfg.cor_dir}")
+        logger.info("Please check the 'cor_dir' path in your config.yaml or CLI arguments.")
         return 1
     
     # Enable AA on the plotter instance if specified in the config (put other graphical runtime settings here if needed)
