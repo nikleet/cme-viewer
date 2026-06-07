@@ -293,13 +293,16 @@ def build_toolbar(state, ctrl, resources):
         color="secondary",
         classes="me-3",
     )
+    # Warmup/date chip
     vuetify3.VChip(
-        "{{ is_warming_up ? 'Caching… ' + warmup_progress + '%' : time_label }}",
+        "{{ is_warming_up ? 'Caching frames… ' + warmup_progress + '%' : time_label }}",
         v_show="time_label || is_warming_up",
-        prepend_icon="{{ is_warming_up ? 'mdi-cached' : 'mdi-calendar-clock' }}",
         variant="tonal",
         size="small",
-        color="{{ is_warming_up ? 'warning' : 'info' }}",
+        **{
+            ":prepend-icon": "is_warming_up ? 'mdi-cached' : 'mdi-calendar-clock'",
+            ":color": "is_warming_up ? 'warning' : 'info'",
+        }
     )
     vuetify3.VSpacer()
 
