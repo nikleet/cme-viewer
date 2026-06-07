@@ -6,6 +6,8 @@ examples/
 todo.md
 requirements.txt
 config.yaml
+scene_manager_copy.py
+.cache_old/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

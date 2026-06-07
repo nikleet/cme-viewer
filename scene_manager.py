@@ -142,12 +142,6 @@ class SceneManager:
                 with self._open_tracer(frame_idx) as (tracer, br_filepath):
                     for label, r_lp, t_lp, p_lp in groups_to_process:
                         logger.info(f"Tracing group '{label}' for frame {frame_idx + 1}...")
-                        logger.info(
-                            f"Group '{label}' launch points (min/max) — "
-                            f"r: [{r_lp.min():.3f}, {r_lp.max():.3f}], "
-                            f"theta: [{t_lp.min():.3f}, {t_lp.max():.3f}], "
-                            f"phi: [{p_lp.min():.3f}, {p_lp.max():.3f}]"
-                        )
                         
                         r_tr, t_tr, p_tr, polarity = self._trace_fieldlines(
                             tracer, br_filepath, (r_lp, t_lp, p_lp)
@@ -161,13 +155,16 @@ class SceneManager:
                             )
                             temp_actor.mapper.dataset.cell_data['polarity'] = polarity.astype(np.int8)
                             self._save_actor_mesh(temp_actor, fl_paths[label])
+                                                        # Diagnostic — remove once resolved
+                            _check = pv.read(fl_paths[label])
+                            _pts = _check.points
                             logger.info(f"Saved mesh for group '{label}'.")
                         finally:
                             temp_plotter.close()
 
         logger.info("Caching complete.")
         logger.info("Loading meshes into RAM for playback...")
-        for frame_idx in range(self.total_frames):
+        for frame_idx in range(self.start_frame, self.end_frame + 1):
             self.ram_cache[frame_idx] = {}
             for key in self.actors.keys():
                 path = self.cache_dir / f"frame_{(frame_idx+1):04d}_{key}_{self.run_id}.vtp"
@@ -190,18 +187,29 @@ class SceneManager:
     
     
     def set_frame(self, frame_idx: int):
-        """Updates all registered actors by loading their meshes from the RAM cache."""
         if not (0 <= frame_idx < self.total_frames):
             return
 
         for key, actor in self.actors.items():
             new_mesh = self.ram_cache.get(frame_idx, {}).get(key)
-            if new_mesh is not None:
-                actor.mapper.dataset.copy_from(new_mesh)
-                actor.mapper.dataset.Modified()
-                actor.mapper.Modified()
-            else:
+            if new_mesh is None:
                 logger.warning(f"Cache missing for frame {frame_idx}, component '{key}'")
+                continue
+            
+            # Instead of using mapper.dataset.copy_from(new_mesh), bypass the filter entirely by replacing the mapper's
+            # input connection with a direct SetInputData to the new mesh. This way we are sure the mapper is using our 
+            # updated geometry directly,and not re-running some upstream filter that may have cached data from a 
+            # previous frame.
+            actor.GetMapper().SetInputData(new_mesh)
+            actor.GetMapper().Modified()
+
+        # Re-assert coloring after geometry swap
+        per_group = self.fl_coloring_config.get('per_group', {})
+        for key, actor in self.actors.items():
+            if key.startswith('fl_'):
+                label = key[3:]
+                cfg = per_group.get(label, self.fl_coloring_config)
+                self._apply_coloring_to_actor(actor, cfg['coloring'], **cfg['kwargs'])
 
     
     def set_actor_property(self, actor_key: str, **props):
@@ -472,7 +480,11 @@ class SceneManager:
                     if coloring != 'random':
                         self._apply_coloring_to_actor(actor, coloring, **coloring_kwargs)
                     fl_actors[label] = actor
-
+                    logger.info(
+                        f"Actor '{label}' mapper input type: "
+                        f"{type(actor.GetMapper().GetInputAlgorithm())} | "
+                        f"HasInputConnection: {actor.GetMapper().GetInputConnection(0,0) is not None}"
+                    )
         return fl_actors
     
 
@@ -494,7 +506,7 @@ class SceneManager:
         br_filepath : Path
         """
         mag_files = self.mag_files_list[frame_idx]
-        with TracerMP(*mag_files, timeout=timeout, **kwargs) as tracer:
+        with TracerMP(*mag_files, timeout=timeout, context='fork', **kwargs) as tracer:
             yield tracer, mag_files[0]
     
     
@@ -750,20 +762,22 @@ class SceneManager:
 
         logger.info(f"Local mode: pre-loading {self.total_frames} frames into vtk.js cache...")
 
-        for frame_idx in range(self.total_frames):
+        for frame_idx in range(self.start_frame, self.end_frame + 1):
             frame_cache = self.ram_cache.get(frame_idx, {})
             for key, actor in self.actors.items():
                 new_mesh = frame_cache.get(key)
                 if new_mesh is not None:
-                    actor.mapper.dataset.copy_from(new_mesh)
-                    actor.mapper.dataset.Modified()
-                    actor.mapper.Modified()
+                    # actor.mapper.dataset.copy_from(new_mesh)
+                    # actor.mapper.dataset.Modified()
+                    # actor.mapper.Modified()
+                    actor.GetMapper().SetInputData(new_mesh)
+                    actor.GetMapper().Modified()
 
             # Tell vtk.js the geometry changed → it issues array.get requests
             self._view_update_fn()
 
             if on_progress:
-                on_progress(frame_idx + 1, self.total_frames)
+                on_progress(frame_idx + 1 - self.start_frame, self.total_frames)
 
             # Yield repeatedly so the event loop can fully drain the array.get
             # requests before we push the next frame.  On localhost, 15 MB
@@ -772,6 +786,6 @@ class SceneManager:
                 await asyncio.sleep(0.1)
 
         # Restore initial frame
-        self.set_frame(0)
+        self.set_frame(self.start_frame)
         self._view_update_fn()
         logger.info("vtk.js cache warmup complete — playback ready.")
