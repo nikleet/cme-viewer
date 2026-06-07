@@ -3,7 +3,7 @@
 import asyncio
 from trame.widgets import vuetify3, html
 
-FRAME_TIME = 0.2
+FRAME_TIME_DEFAULT = 0.3
 
 MGRAM_CMAPS = [
     {"title": "Seismic",   "value": "seismic"},
@@ -20,7 +20,8 @@ FL_DEFAULT_COLORS = [
 ]
 
 
-# State
+
+# ── State ──────────────────────────────────────────────────────────────────────
 
 def init_state(state, scene):
     state.total_frames     = scene.total_frames if scene else 1
@@ -29,18 +30,18 @@ def init_state(state, scene):
     state.frame_label      = "Frame: 1"
     state.time_label       = ""
     state.drawer           = False
-    state.open_panels      = ["mgram", "fl"]
+    state.open_panels      = ["playback", "mgram", "fl"]  # playback panel open by default
     state.mgram_visible    = True
     state.mgram_cmap       = "seismic"
     state.mgram_clim_min   = -10.0
     state.mgram_clim_max   = 10.0
     state.fl_coloring_mode = "random"
     state.fl_global_line_width = 5.0
-
-    # Warmup state; only relevant in local mode
+    # Playback
+    state.frame_time       = FRAME_TIME_DEFAULT  # user-adjustable frame duration in seconds
+    state.is_rendering     = False               # True while a frame is being processed
     state.is_warming_up    = False
-    state.warmup_progress  = 0   # 0–100
-
+    state.warmup_progress  = 0
     if scene:
         initial_time = scene.get_frame_time(0)
         if initial_time:
@@ -52,33 +53,27 @@ def init_state(state, scene):
             state[f"fl_{label}_line_width"] = 5.0
 
 
-# Callbacks
+# ── Callbacks ──────────────────────────────────────────────────────────────────
 
 def setup_callbacks(state, ctrl, resources):
     scene        = resources.get("scene")
     _loop_id     = [0]
     _is_updating = [False]
+    is_local     = scene and scene.mode == 'local'
+    _warmed_up   = [not is_local]
 
-    # Warmup only needed once, only in local mode
-    is_local = scene and scene.mode == 'local'
-    _warmed_up = [not is_local]   # True for remote → skip warmup entirely
-
-    # Playback 
+    # ── Playback ──────────────────────────────────────────────────────────────
 
     @state.change("playing")
     async def on_play(playing, **kwargs):
         if not playing:
             return
 
-        # Local mode: warm up vtk.js cache on first play press 
-        # vtk.js fetches geometry arrays by content hash.  Without warming up,
-        # each frame triggers ~15 MB of WebSocket transfers that block the
-        # asyncio event loop.  We cycle through every frame once so vtk.js
-        # caches all arrays; subsequent frame changes serve from cache only.
+        # ── Local mode: warm up vtk.js array cache on first play ─────────────
         if not _warmed_up[0]:
             _warmed_up[0] = True
-            state.playing        = False   # hold playback until cache is ready
-            state.is_warming_up  = True
+            state.playing = False
+            state.is_warming_up = True
             state.warmup_progress = 0
             state.flush()
 
@@ -87,26 +82,73 @@ def setup_callbacks(state, ctrl, resources):
                 state.flush()
 
             await scene._warm_up_vtk_cache(on_progress=report_progress)
-
-            state.is_warming_up   = False
+            state.is_warming_up = False
             state.warmup_progress = 100
-            state.playing         = True   # re-triggers on_play with warmed cache
+            state.playing = True
             state.flush()
             return
+        # ─────────────────────────────────────────────────────────────────────
 
-        # Continue with normal playback loop
         _loop_id[0] += 1
         my_id = _loop_id[0]
+        loop  = asyncio.get_running_loop()
+
         while state.playing and _loop_id[0] == my_id:
-            state.current_frame = (state.current_frame + 1) % state.total_frames
+            t_start    = loop.time()
+            next_frame = (state.current_frame + 1) % state.total_frames
+
+            # --- Update geometry (synchronous) ----------------------
+            # Set is_rendering=True and advance the slider in one atomic flush.
+            # state.flush() is synchronous: it pushes the state to the browser
+            # AND calls on_frame_change inline, which calls scene.set_frame().
+            # By the time flush() returns, the new geometry is loaded but NOT
+            # yet sent to the browser; that happens when pushing to the browser..
+            state.is_rendering  = True
+            state.current_frame = next_frame
             state.flush()
-            await asyncio.sleep(0)   # yield before view push
+
+            # Immediately check whether pause was pressed during the render.
+            # If so, discard this frame rather than pushing it to the browser.
+            if not state.playing or _loop_id[0] != my_id:
+                state.is_rendering = False
+                state.flush()
+                break
+
+            # --- Push to browser (yield first) ----------------------
+            # Yielding before view_update lets the event loop drain any queued
+            # events (play/pause clicks, camera drags) before spending time on
+            # the potentially-heavy WebSocket push. This should hopefully keep the UI responsive.
+            await asyncio.sleep(0)
+
             if ctrl.view_update:
                 ctrl.view_update()
-            await asyncio.sleep(FRAME_TIME)
+
+            state.is_rendering = False
+            # is_rendering=False will be batched into the next state.flush().
+
+            # --- Wall-clock throttle --------------------------------
+            # Sleep only what remains of the frame budget, accounting for the
+            # time already spent in Phases 1 and 2. This prevents:
+            #   • Acceleration when rendering is fast (no extra sleep = no gap).
+            #   • Rubberbanding when rendering is slow (remaining ≤ 0 = no sleep).
+            elapsed   = loop.time() - t_start
+            budget    = max(0.1, float(getattr(state, 'frame_time', FRAME_TIME_DEFAULT)))
+            remaining = budget - elapsed
+            if remaining > 0.005:
+                await asyncio.sleep(remaining)
 
     @state.change("current_frame")
     def on_frame_change(current_frame, **kwargs):
+        """
+        Updates geometry and labels for the given frame.
+
+        During playback:  only loads geometry; on_play handles the view push.
+        During scrubbing: also calls ctrl.view_update() for immediate feedback.
+
+        Keeping view_update OUT of this callback during playback eliminates
+        the "backed-up frames" problem: there is now exactly one view push per
+        loop iteration, called after yielding, so the browser queue never grows.
+        """
         if _is_updating[0]:
             return
         _is_updating[0] = True
@@ -114,14 +156,19 @@ def setup_callbacks(state, ctrl, resources):
             if scene:
                 scene.set_frame(current_frame)
                 state.frame_label = f"Frame: {current_frame + 1}"
-                frame_time = scene.get_frame_time(current_frame)
-                state.time_label = frame_time.strftime("%Y-%m-%d %H:%M:%S") if frame_time else ""
+                frame_time_val    = scene.get_frame_time(current_frame)
+                state.time_label  = (
+                    frame_time_val.strftime("%Y-%m-%d %H:%M:%S")
+                    if frame_time_val else ""
+                )
+                # Push immediately only when the user is manually scrubbing.
+                # During playback this is handled by on_play (Phase 2 above).
                 if not state.playing and ctrl.view_update:
                     ctrl.view_update()
         finally:
             _is_updating[0] = False
 
-    # Magnetogram 
+    # --- Magnetogram ------------------------------------------------ 
 
     @state.change("mgram_visible")
     def on_mgram_visible(mgram_visible, **kwargs):
@@ -143,7 +190,7 @@ def setup_callbacks(state, ctrl, resources):
             except (TypeError, ValueError):
                 pass
 
-    # Fieldlines
+    # --- Fieldlines ------------------------------------------------ 
 
     @state.change("fl_coloring_mode")
     def on_fl_coloring_mode(fl_coloring_mode, **kwargs):
@@ -197,26 +244,39 @@ def _register_group_callbacks(state, scene, label: str):
             line_width = 5.0
         scene.set_actor_property(f"fl_{label}", line_width=line_width)
 
-# Toolbar
+# ── Toolbar ────────────────────────────────────────────────────────────────────
 
 def build_toolbar(state, ctrl, resources):
     scene = resources.get("scene")
     init_state(state, scene)
     setup_callbacks(state, ctrl, resources)
 
-    # Play button: shows spinner and is disabled while the vtk.js cache warms up on the first play press.  
-    # In remote mode is_warming_up is always False so this has no effect there.
+    # Play / Pause
+    # `loading` + `disabled` only during warmup; during is_rendering the button
+    # stays clickable so the user can pause mid-frame without waiting.
     with vuetify3.VBtn(
         icon=True,
         click="playing = !playing",
         variant="text",
         color="primary",
         disabled=("is_warming_up", False),
-        loading=("is_warming_up", False),   # Vuetify spinner replaces icon
+        loading=("is_warming_up", False),
     ):
         vuetify3.VIcon("{{ playing ? 'mdi-pause' : 'mdi-play' }}")
 
-    # Frame Slider
+    # Thin indeterminate bar at the toolbar bottom — visible while a frame is
+    # actively being rendered during playback. Tells the user "something is
+    # happening" without blocking interaction.
+    vuetify3.VProgressLinear(
+        v_show="is_rendering && playing",
+        indeterminate=True,
+        color="primary",
+        style=(
+            "position: absolute; bottom: 0; left: 0; right: 0;"
+            " height: 3px; margin: 0; border-radius: 0; z-index: 10;"
+        ),
+    )
+
     vuetify3.VSlider(
         v_model=("current_frame", 0),
         min=0,
@@ -226,36 +286,37 @@ def build_toolbar(state, ctrl, resources):
         density="compact",
         style="max-width: 400px; margin: 0 16px;",
     )
-    # Frame Chip
     vuetify3.VChip(
-        "{{ frame_label }}", 
-        variant="outlined", 
-        size="small", 
+        "{{ frame_label }}",
+        variant="outlined",
+        size="small",
         color="secondary",
-        classes='me-3'
+        classes="me-3",
     )
-    
-    # Warmup/date chip
     vuetify3.VChip(
-        "{{ is_warming_up ? 'Caching frames… ' + warmup_progress + '%' : time_label }}",
+        "{{ is_warming_up ? 'Caching… ' + warmup_progress + '%' : time_label }}",
         v_show="time_label || is_warming_up",
-        prepend_icon=("is_warming_up ? 'mdi-cached' : 'mdi-calendar-clock'",),
+        prepend_icon="{{ is_warming_up ? 'mdi-cached' : 'mdi-calendar-clock' }}",
         variant="tonal",
         size="small",
-        color=("is_warming_up ? 'warning' : 'info'",),
+        color="{{ is_warming_up ? 'warning' : 'info' }}",
     )
-    
     vuetify3.VSpacer()
 
 
-# Sidebar
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 
 def build_sidebar(state, resources):
     scene = resources.get("scene")
     with vuetify3.VContainer(fluid=True, classes="pa-3"):
         vuetify3.VListSubheader("Scene Controls", classes="px-0 mb-2")
 
-        with vuetify3.VExpansionPanels(multiple=True, v_model=("open_panels", ["mgram", "fl"])):
+        with vuetify3.VExpansionPanels(
+            multiple=True,
+            v_model=("open_panels", ["playback", "mgram", "fl"]),
+        ):
+            _build_playback_panel()   # ← new, first so it's immediately visible
             _build_mgram_panel()
             _build_fl_panel(scene)
 
@@ -269,6 +330,60 @@ def build_sidebar(state, resources):
             size="small",
         )
 
+
+def _build_playback_panel():
+    """Frame duration slider and single-step buttons."""
+    with vuetify3.VExpansionPanel(value="playback", title="Playback"):
+        with vuetify3.VExpansionPanelText():
+
+            # Frame duration (= time budget per frame)
+            vuetify3.VLabel(
+                "Frame Duration (s)",
+                classes="text-caption text-medium-emphasis",
+            )
+            with vuetify3.VRow(align="center", no_gutters=True, classes="mt-1 mb-4"):
+                with vuetify3.VCol(style="flex-grow: 1;"):
+                    vuetify3.VSlider(
+                        v_model=("frame_time", FRAME_TIME_DEFAULT),
+                        min=0.1,
+                        max=3.0,
+                        step=0.1,
+                        hide_details=True,
+                        density="compact",
+                    )
+                with vuetify3.VCol(cols="auto", classes="ps-2"):
+                    vuetify3.VTextField(
+                        v_model=("frame_time", FRAME_TIME_DEFAULT),
+                        density="compact",
+                        style="width: 65px;",
+                        type="number",
+                        variant="plain",
+                        hide_details=True,
+                    )
+
+            # Single-step buttons (disabled during playback)
+            vuetify3.VLabel("Step", classes="text-caption text-medium-emphasis")
+            with vuetify3.VRow(no_gutters=True, classes="mt-1"):
+                with vuetify3.VCol(cols=6, classes="pr-1"):
+                    vuetify3.VBtn(
+                        "← Prev",
+                        click="current_frame = Math.max(0, current_frame - 1)",
+                        variant="outlined",
+                        density="compact",
+                        block=True,
+                        size="small",
+                        disabled=("playing", False),
+                    )
+                with vuetify3.VCol(cols=6, classes="pl-1"):
+                    vuetify3.VBtn(
+                        "Next →",
+                        click="current_frame = Math.min(total_frames - 1, current_frame + 1)",
+                        variant="outlined",
+                        density="compact",
+                        block=True,
+                        size="small",
+                        disabled=("playing", False),
+                    )
 
 def _build_mgram_panel():
     with vuetify3.VExpansionPanel(value="mgram", title="Magnetogram"):
