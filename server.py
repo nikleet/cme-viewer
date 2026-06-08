@@ -159,7 +159,7 @@ def main():
     interactive_ratio = cfg.runtime_cfg.interactive_ratio
     
     # Build Trame UI
-    with SinglePageWithDrawerLayout(server) as layout:
+    with SinglePageWithDrawerLayout(server, title="CME Viewer") as layout:
         layout.drawer.width = 350
         with layout.toolbar:
             build_toolbar(state, ctrl, resources)
