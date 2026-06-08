@@ -1,14 +1,28 @@
 # utils.py
+import logging
 import numpy as np
 import datetime as dt
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import pyvista as pv
 from pathlib import Path
 import pyhdf.SD as h4
+from pyparsing import Optional
 
+# PSI Imports
 from pyvisual.core.mesh3d import build_slice_polydata, build_spline_polydata
 import pyvisual.core.parsers as parsers
+import astropy.units as u
+import sunpy.sun.constants as sun_constants
+from pyvisual.core._styling import (
+    RANDOM_COLORING_DEFAULTS,
+    FL_POLARITY_COLORING_DEFAULTS,
+    FIELDLINE_KWARGS,
+)
+
+logger = logging.getLogger(__name__)
+
 
 # ========= COLOR UTILITIES =========
 class MplColorHelper:
@@ -26,6 +40,22 @@ class MplColorHelper:
         r, g, b, a = self.scalarMap.to_rgba(val)
         return int(r * 255), int(g * 255), int(b * 255), a
 
+
+def fl_plot_kwargs(coloring: str | None, **kwargs) -> dict:
+        """Translates a coloring mode into kwargs for pyvista.Plotter.add_mesh."""
+        match coloring:
+            case 'random':
+                return RANDOM_COLORING_DEFAULTS | {
+                    'scalars': 'line_index',
+                    'clim': (0, 255),
+                    'n_colors': 256,
+                } | kwargs
+            case 'polarity':
+                return FL_POLARITY_COLORING_DEFAULTS | FIELDLINE_KWARGS | {
+                    'scalars': 'polarity'
+                } | kwargs
+            case _:
+                return kwargs
 
 # ========= TIME UTILITIES =========
 
@@ -78,6 +108,155 @@ def get_hdf_times(fname):
                 t_val = row[0]
             times[t_] = float(t_val)
     return times
+
+def parse_datetime(time_str: Optional[str], domain_label: str) -> dt.datetime:
+    """Converts configuration time strings into standard datetime objects.
+
+    Defaults to January 1st, 1990 if the input string is absent.
+
+    Parameters
+    ----------
+    time_str : str | None
+        Optional string representing the date and time in '%m/%d/%Y %H:%M:%S' format.
+    domain_label : str
+        String identifier used to clarify logging output if the fallback is triggered.
+
+    Returns
+    -------
+    dt_obj : datetime
+        A rounded datetime object representing the start epoch.
+    """
+    if time_str:
+        dt_obj = dt.datetime.strptime(time_str, '%m/%d/%Y %H:%M:%S')
+        return round_seconds(dt_obj)
+    else:
+        return dt.datetime.strptime('01/01/1990 00:00:00', '%m/%d/%Y %H:%M:%S')
+
+
+def build_timeline_map(
+    ut_datetimes_cor: np.ndarray,
+    ut_datetimes_hel: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Constructs parallel arrays linking global simulation playback frames for the automatic coupled tracking mode.
+
+    Pairs coronal steps with their nearest heliospheric counterpart by calculating minimum timedelta offsets, then 
+    appends the remaining unique heliospheric steps chronologically.
+
+    Parameters
+    ----------
+    ut_datetimes_cor : ndarray
+        Calculated UT datetime objects for each coronal domain frame.
+    ut_datetimes_hel : ndarray
+        Calculated UT datetime objects for each heliospheric domain frame.
+
+    Returns
+    -------
+    cor_idx : ndarray, shape (K,)
+        Mapped coronal file indices per timeline frame; -1 indicates an unmapped frame.
+    hel_idx : ndarray, shape (K,)
+        Mapped heliospheric file indices per timeline frame; -1 indicates an unmapped frame.
+    global_times : ndarray, shape (K,)
+        Corresponding timeline datetimes matching the target frame array length K.
+    """
+    n_cor = len(ut_datetimes_cor)
+    n_hel = len(ut_datetimes_hel)
+
+    p1_cor = np.arange(n_cor)
+    
+    if n_hel > 0 and n_cor > 0:
+        t0_ref = ut_datetimes_cor[0]
+        cor_offsets = np.array([(t - t0_ref).total_seconds() for t in ut_datetimes_cor])
+        hel_offsets = np.array([(t - t0_ref).total_seconds() for t in ut_datetimes_hel])
+        
+        p1_hel = np.array([
+            int(np.argmin(np.abs(hel_offsets - t_cor)))
+            for t_cor in cor_offsets
+        ], dtype=int)
+    else:
+        p1_hel = np.zeros(n_cor, dtype=int)
+        
+    p1_times = ut_datetimes_cor
+
+    last_matched_hel_idx = p1_hel[-1] if len(p1_hel) > 0 else -1
+    p2_hel = np.arange(last_matched_hel_idx + 1, n_hel)
+    
+    if len(p2_hel) > 0:
+        p2_cor = np.full(len(p2_hel), n_cor - 1, dtype=int)
+        p2_times = ut_datetimes_hel[p2_hel]
+        
+        cor_idx = np.concatenate([p1_cor, p2_cor])
+        hel_idx = np.concatenate([p1_hel, p2_hel])
+        global_times = np.concatenate([p1_times, p2_times])
+    else:
+        cor_idx = p1_cor
+        hel_idx = p1_hel
+        global_times = p1_times
+
+    logger.info(f"Timeline 'both_auto' mapping generated successfully. Total sequential frames: {len(cor_idx)}")
+    return cor_idx, hel_idx, global_times
+
+
+def compute_longitudinal_shifts(
+    cor_indices: np.ndarray,
+    hel_indices: np.ndarray,
+    ut_datetimes_cor: np.ndarray,
+    ut_datetimes_hel: np.ndarray,
+    helio_shift: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculates longitudinal alignment shifts and timedeltas between domains for every mapped frame.
+
+    Computes the physical time difference between matched coronal and heliospheric frames,
+    converting it into a rotational shift in radians based on the solar rotation rate.
+
+    Parameters
+    ----------
+    cor_indices : ndarray, shape (K,)
+        Mapped coronal file indices per timeline frame.
+    hel_indices : ndarray, shape (K,)
+        Mapped heliospheric file indices per timeline frame.
+    ut_datetimes_cor : ndarray
+        Parsed datetime objects for the coronal domain frames.
+    ut_datetimes_hel : ndarray
+        Parsed datetime objects for the heliospheric domain frames.
+    static_shift : float
+        Default fallback longitudinal shift in radians when dynamic tracking is missing.
+
+    Returns
+    -------
+    shifts : ndarray, shape (K,)
+        Computed rotational co-rotation shifts in radians per timeline frame.
+    timedeltas : ndarray, shape (K,)
+        Time differences in seconds (Helio - Coronal) per timeline frame; contains NaN if uncoupled.
+    """
+    total_len = len(cor_indices)
+    shifts = np.full(total_len, helio_shift if helio_shift is not None else 0.0)
+    timedeltas = np.full(total_len, np.nan)
+
+    if len(ut_datetimes_cor) == 0 or len(ut_datetimes_hel) == 0:
+        return shifts, timedeltas
+
+    try:
+        omega_sun = sun_constants.sidereal_rotation_rate.to(u.rad / u.h).value
+        
+        for i in range(total_len):
+            c_idx = cor_indices[i]
+            h_idx = hel_indices[i]
+            
+            if c_idx >= 0 and h_idx >= 0:
+                t_cor = ut_datetimes_cor[c_idx]
+                t_hel = ut_datetimes_hel[h_idx]
+                
+                dt_seconds = (t_hel - t_cor).total_seconds()
+                timedeltas[i] = dt_seconds
+                
+                delta_t_hours = dt_seconds / 3600.0
+                shifts[i] = delta_t_hours * omega_sun
+
+        logger.info("Dynamic timeline alignment shifts and timedeltas successfully configured.")
+    except Exception as e:
+        logger.warning(f"Failed to calculate dynamic time-shifts: {e}. Defaulting to configuration defaults.")
+        
+    return shifts, timedeltas
 
 
 # ======== MESH UTILITIES =========
@@ -188,6 +367,11 @@ def write_lps(lp_fpath: Path, r_lps, theta_lps, phi_lps) -> None:
         for r, theta, phi in zip(r_lps, theta_lps, phi_lps):
             lp_file.write(f'{r:e}\t{theta:e}\t{phi:e}\n')
 
+
+def save_actor_mesh(self, actor: pv.Actor, path: Path):
+        """Utility to save an actor's mesh to disk."""
+        if actor and actor.mapper and actor.mapper.dataset:
+            actor.mapper.dataset.save(path)
 
 # ========= LAUNCH POINTS UTILITIES =========
 

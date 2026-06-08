@@ -23,21 +23,23 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Core Arguments
-    p.add_argument("--mode", choices=["local", "remote"], default=None,
-                   help="Runtime mode: 'local' (browser) or 'remote' (headless).")
+    # Domain Arguments
     p.add_argument("--cor-dir", type=Path, default=None,
                    help="Directory containing coronal magnetic field and tracer .hdf files.")
     
-    # Multi-Domain Arguments
     p.add_argument("--hel-dir", type=Path, default=None,
                    help="Directory containing heliospheric magnetic field and tracer .hdf files (optional).")
-    p.add_argument("--r-interface", type=float, default=None,
-                   help="Radial boundary interface (in Solar Radii) connecting coronal and heliospheric domains.")
+    p.add_argument("--r-hel", type=float, default=None,
+                   help="Radial inner boundary (in Solar Radii) of heliospheric domain or the interface connecting \
+                   the coronal and heliospheric domains if both are present.")
     p.add_argument("--helio-shift", type=float, default=None,
-                   help="Longitudinal shift angle (in RADIANS) between heliospheric and coronal domains.")
-
+                   help="Constant longitudinal shift angle (in RADIANS) between heliospheric and coronal domains.")
+    p.add_argument('--auto-align', action='store_true', default=None,
+                   help="Automatically match time steps and compute longitudinal shift between domains for best alignment.")
+    
     # Server & Rendering Arguments
+    p.add_argument("--mode", choices=["local", "remote"], default=None,
+                   help="Runtime mode: 'local' (browser) or 'remote' (headless).")
     server_args = p.add_argument_group("Server & Render Settings")
     server_args.add_argument("--host", default=None,
                         help="Interface to bind to. Default 127.0.0.1 (SSH tunnel access). "
@@ -60,9 +62,11 @@ def parse_args():
                             help="Last frame to load in sequence.")
     scene_args.add_argument("--time-file", default=None,
                      help="Name of file storing simulation time steps.")
-    scene_args.add_argument("--t0", default=None,
-                     help="Initial time of simulation in 'mm/dd/yyyy HH:MM:SS' format.")
-
+    scene_args.add_argument("--t0-cor", default=None,
+                     help="Initial time of coronal simulation in 'mm/dd/yyyy HH:MM:SS' format.")
+    scene_args.add_argument("--t0-hel", default=None,
+                     help="Initial time of heliospheric simulation in 'mm/dd/yyyy HH:MM:SS' format.")
+    
     # Tracer Arguments
     fl_args = p.add_argument_group("Tracer & Fieldline Settings")
     fl_args.add_argument("--tracer-header", default=None,
@@ -83,8 +87,10 @@ def parse_args():
     # Other Arguments 
     p.add_argument("--verbose", action="store_true", default=None, 
                    help="Enable debug logs.")
-    p.add_argument("--preserve-cache", action="store_true", default=None, 
-                   help="Preserve old cached data if new data directory is used.")
+    p.add_argument("--ignore-manifest", action="store_true", default=None, 
+                   help="Preserve old cached data if new run data directory is used.")
+    p.add_argument("--clear-cache", action="store_true", default=None, 
+                   help="Clear cached data before starting for a fresh run.")
 
     return p.parse_args()
 
@@ -127,21 +133,25 @@ def main():
     state, ctrl = server.state, server.controller
     
     # Initialize Scene Manager
-    if cfg.scene_cfg.cor_dir and cfg.scene_cfg.cor_dir.exists():
-        if cfg.scene_cfg.hel_dir and not cfg.scene_cfg.hel_dir.exists():
-            logger.critical(f"Heliospheric directory specified but not found: {cfg.scene_cfg.hel_dir}")
-            return 1
+    try:
         scene = SceneManager(cfg.scene_cfg, line_smoothing=True, mode=cfg.runtime_cfg.mode)
-        logger.info("Initializing scene manager...")
-    else:
-        logger.critical(f"Coronal directory not found: {cfg.scene_cfg.cor_dir}")
-        logger.info("Please check the 'cor_dir' path in your config.yaml or CLI arguments.")
+    except FileNotFoundError as e:
+        logger.critical(str(e))
+        logger.info("Please verify the data directory paths in your config.yaml or CLI arguments.")
+        return 1
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred during SceneManager initialization: {e}")
         return 1
     
     # Enable AA on the plotter instance if specified in the config (put other graphical runtime settings here if needed)
     if cfg.runtime_cfg.aa:
         scene.plotter.enable_anti_aliasing(cfg.runtime_cfg.aa, multi_samples=cfg.runtime_cfg.multi_samples)
     
+    if cfg.runtime_cfg.clear_cache:
+        logger.info("Clearing cache as per configuration...")
+        scene.clear_cache(all_runs=True)
+    
+    logger.info("Initializing scene manager...")
     # Setup initial frame and preload
     scene.initialize()
     logger.info("Scene initialized.")

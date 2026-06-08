@@ -19,7 +19,8 @@ class RuntimeConfig:
     render_mode: str = "client"
     offscreen: bool = False
     verbose: bool = False
-    
+    clear_cache: bool = False
+
     # Defined only for remote mode:
     still_ratio: Optional[float] = None
     interactive_ratio: Optional[float] = None
@@ -56,9 +57,11 @@ class SceneConfig:
     # Initialize argument defaults:
     cor_dir: Optional[Path] = None
     hel_dir: Optional[Path] = None          
-    r_interface: float = 30.0               
-    helio_shift: float = 0.0                
-    t0: Optional[str] = None
+    r_hel: float = 30.0   # solar radii          
+    helio_shift: float = 0.0    # longitudinal shift in radians between coronal and heliospheric domains
+    auto_align: bool = False    # whether to automatically compute time step matching and longitudinal shift for best alignment                
+    t0_cor: Optional[str] = None    # cor simulation start time as string (e.g. "01/01/1990 00:00:00")
+    t0_hel: Optional[str] = None    # hel simulation start time as string (e.g. "01/01/1990 00:00:00")
     time_file: str = "mas_dumps_3d.txt"
     tracer_header: str = "tracer_header.dat"
     tracer_prefix: str = "tracers_pos"
@@ -71,7 +74,7 @@ class SceneConfig:
     max_steps: int = 500
     start_frame: Optional[int] = 0
     end_frame: Optional[int] = None
-    preserve_cache: bool = False
+    ignore_manifest: bool = False
 
 
 @dataclass
